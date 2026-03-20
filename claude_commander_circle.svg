@@ -1,0 +1,88 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="cc"><circle cx="256" cy="256" r="240"/></clipPath>
+  </defs>
+
+  <!-- Badge background -->
+  <circle cx="256" cy="256" r="248" fill="#111111"/>
+  <circle cx="256" cy="256" r="240" fill="#1A1A1A"/>
+
+  <!-- ── CIRCUIT TRACES radiating from center ── -->
+  <!-- Top spine -->
+  <line x1="256" y1="256" x2="256" y2="52" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <!-- Bottom spine -->
+  <line x1="256" y1="256" x2="256" y2="460" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <!-- Left spine -->
+  <line x1="256" y1="256" x2="52"  y2="256" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <!-- Right spine -->
+  <line x1="256" y1="256" x2="460" y2="256" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+
+  <!-- Diagonal traces -->
+  <line x1="256" y1="256" x2="112" y2="112" stroke="#D4632A" stroke-width="1" opacity="0.18"/>
+  <line x1="256" y1="256" x2="400" y2="112" stroke="#D4632A" stroke-width="1" opacity="0.18"/>
+  <line x1="256" y1="256" x2="112" y2="400" stroke="#D4632A" stroke-width="1" opacity="0.18"/>
+  <line x1="256" y1="256" x2="400" y2="400" stroke="#D4632A" stroke-width="1" opacity="0.18"/>
+
+  <!-- Horizontal branches — top -->
+  <line x1="182" y1="142" x2="330" y2="142" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="182" y1="142" x2="182" y2="170" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="330" y1="142" x2="330" y2="170" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+
+  <!-- Horizontal branches — bottom -->
+  <line x1="182" y1="370" x2="330" y2="370" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="182" y1="342" x2="182" y2="370" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="330" y1="342" x2="330" y2="370" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+
+  <!-- Vertical branches — left -->
+  <line x1="142" y1="182" x2="142" y2="330" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="142" y1="182" x2="170" y2="182" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="142" y1="330" x2="170" y2="330" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+
+  <!-- Vertical branches — right -->
+  <line x1="370" y1="182" x2="370" y2="330" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="342" y1="182" x2="370" y2="182" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+  <line x1="342" y1="330" x2="370" y2="330" stroke="#D4632A" stroke-width="1.5" opacity="0.3"/>
+
+  <!-- Solder nodes on branches -->
+  <circle cx="256" cy="142" r="4" fill="#D4632A" opacity="0.55"/>
+  <circle cx="256" cy="370" r="4" fill="#D4632A" opacity="0.55"/>
+  <circle cx="142" cy="256" r="4" fill="#D4632A" opacity="0.55"/>
+  <circle cx="370" cy="256" r="4" fill="#D4632A" opacity="0.55"/>
+  <circle cx="182" cy="142" r="3" fill="#D4632A" opacity="0.45"/>
+  <circle cx="330" cy="142" r="3" fill="#D4632A" opacity="0.45"/>
+  <circle cx="182" cy="370" r="3" fill="#D4632A" opacity="0.45"/>
+  <circle cx="330" cy="370" r="3" fill="#D4632A" opacity="0.45"/>
+  <circle cx="142" cy="182" r="3" fill="#D4632A" opacity="0.45"/>
+  <circle cx="142" cy="330" r="3" fill="#D4632A" opacity="0.45"/>
+  <circle cx="370" cy="182" r="3" fill="#D4632A" opacity="0.45"/>
+  <circle cx="370" cy="330" r="3" fill="#D4632A" opacity="0.45"/>
+
+  <!-- ── OUTER RINGS ── -->
+  <circle cx="256" cy="256" r="240" fill="none" stroke="#D4632A" stroke-width="3"/>
+  <circle cx="256" cy="256" r="226" fill="none" stroke="#D4632A" stroke-width="0.8" opacity="0.35"/>
+
+  <!-- ── CENTRAL COMMAND OCTAGON ── -->
+  <!-- Outer octagon -->
+  <polygon fill="#1A1A1A" stroke="#D4632A" stroke-width="2.5"
+    points="256,146 306,162 340,206 340,306 306,350 256,366 206,350 172,306 172,206 206,162"/>
+  <!-- Inner octagon fill tint -->
+  <polygon fill="#D4632A" opacity="0.07"
+    points="256,146 306,162 340,206 340,306 306,350 256,366 206,350 172,306 172,206 206,162"/>
+  <!-- Inner octagon ring -->
+  <polygon fill="none" stroke="#D4632A" stroke-width="1" opacity="0.4"
+    points="256,166 298,179 324,210 324,302 298,333 256,346 214,333 188,302 188,210 214,179"/>
+
+  <!-- ── TERMINAL INSIGNIA inside octagon ── -->
+  <!-- ">" chevron -->
+  <polygon fill="#D4632A"
+    points="208,222 248,256 208,290 224,290 260,256 224,222"/>
+  <!-- Cursor bar -->
+  <rect x="268" y="243" width="42" height="26" rx="3" fill="#D4632A"/>
+
+  <!-- ── RANK PIPS at cardinal octagon edges ── -->
+  <circle cx="256" cy="150" r="6" fill="#D4632A"/>
+  <circle cx="256" cy="362" r="6" fill="#D4632A"/>
+  <circle cx="176" cy="256" r="6" fill="#D4632A"/>
+  <circle cx="336" cy="256" r="6" fill="#D4632A"/>
+
+</svg>

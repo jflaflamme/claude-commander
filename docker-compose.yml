@@ -1,0 +1,14 @@
+services:
+  bot:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+    container_name: claude-commander
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      # Mount project directories so Claude can access them
+      - ${PROJECTS_DIR}:${PROJECTS_DIR}:rw
