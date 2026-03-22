@@ -802,12 +802,18 @@ async def _run_and_reply(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
     last_status: list[str] = []
+    last_status_edit_time: list[float] = [0.0]
+    STATUS_THROTTLE_SECS = 10.0
 
     async def on_status(label: str) -> None:
         text = f"{base}\n\n{html.escape(label)}"
         if last_status and last_status[0] == text:
             return
+        now = asyncio.get_event_loop().time()
+        if now - last_status_edit_time[0] < STATUS_THROTTLE_SECS:
+            return
         last_status[:] = [text]
+        last_status_edit_time[0] = now
         try:
             await status_msg.edit_text(
                 text, parse_mode="HTML", reply_markup=buttons,
@@ -1202,12 +1208,18 @@ async def callback_quick_reply(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
     last_status: list[str] = []
+    last_status_edit_time: list[float] = [0.0]
+    STATUS_THROTTLE_SECS = 10.0
 
     async def on_status(label: str) -> None:
         text = f"{base}\n\n{html.escape(label)}"
         if last_status and last_status[0] == text:
             return
+        now = asyncio.get_event_loop().time()
+        if now - last_status_edit_time[0] < STATUS_THROTTLE_SECS:
+            return
         last_status[:] = [text]
+        last_status_edit_time[0] = now
         try:
             await status_msg.edit_text(
                 text, parse_mode="HTML", reply_markup=buttons,
