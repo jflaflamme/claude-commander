@@ -50,7 +50,20 @@ You (Telegram) --> Bot --> ClaudeSDKClient (persistent) --> Claude Code CLI --> 
 curl -fsSL https://raw.githubusercontent.com/jflaflamme/claude-commander/main/install.sh | bash
 ```
 
-This clones the repo, installs `uv` if needed, and sets up dependencies. Then edit `~/claude-commander/.env` with your credentials and run `uv run python bot.py`.
+This clones the repo, installs `uv` if needed, syncs dependencies, and on Linux automatically installs and enables the systemd user service. After it finishes:
+
+```bash
+# Fill in your credentials
+nano ~/claude-commander/.env
+
+# Start the bot
+systemctl --user start claude-commander.service
+
+# Auto-start at boot without login (one-time, needs sudo)
+sudo loginctl enable-linger $USER
+```
+
+After that, send `/update` to your bot any time you want to pull the latest version and restart in-place.
 
 ## Manual Setup
 
@@ -104,7 +117,39 @@ uv sync
 uv run python bot.py
 ```
 
-### 3. Run with Docker
+### 3. Auto-start with systemd (Linux)
+
+The installer sets this up automatically on Linux. To do it manually:
+
+```bash
+# Generate the service file
+mkdir -p ~/.config/systemd/user
+sed "s|{INSTALL_DIR}|$HOME/claude-commander|g" \
+    ~/claude-commander/claude-commander.service \
+    > ~/.config/systemd/user/claude-commander.service
+
+# Enable and start
+systemctl --user daemon-reload
+systemctl --user enable claude-commander.service
+systemctl --user start claude-commander.service
+```
+
+To start at boot without needing to log in (run once, needs sudo):
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+Check status and logs:
+
+```bash
+systemctl --user status claude-commander.service
+journalctl --user -u claude-commander.service -f
+```
+
+To update a running service, just send `/update` to your bot — it pulls the latest code, syncs deps, and re-execs in place.
+
+### 4. Run with Docker
 
 Set `PROJECTS_DIR` in your `.env` to the parent directory that contains your projects:
 
@@ -136,6 +181,7 @@ docker compose up --build -d
 | `/reset <project>` | Disconnect client and clear session |
 | `/history <project>` | Past sessions |
 | `/permissions` | List/revoke saved tool permissions |
+| `/update` | Check for updates and restart |
 | `/feedback <text>` | Submit feedback about the bot |
 
 After `/ask` or `/switch`, plain text messages go directly to that project. You can also switch projects with natural language — `switch to myproject` or `use myproject` works the same as `/switch myproject`.
@@ -186,6 +232,7 @@ Set `GROQ_API_KEY` in your `.env` to enable it. Without it, voice messages retur
 - **Unknown command suggestions** — typos like `/project` suggest `/projects` via fuzzy match
 - **Single-instance guard** — PID file prevents accidental duplicate bot instances
 - **HTML formatting** — markdown converted to Telegram HTML with plain-text fallback
+- **Self-update** — `/update` checks for new commits, shows a changelog, and restarts in-place on confirm
 
 ## Security
 

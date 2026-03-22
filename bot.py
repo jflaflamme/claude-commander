@@ -644,6 +644,81 @@ async def cmd_permissions(
     await update.message.reply_text("\n".join(lines))
 
 
+@cmd("update", "check for updates and restart")
+async def cmd_update(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not is_admin(update):
+        return
+
+    bot_dir = Path(__file__).parent
+    msg = await update.message.reply_text("🔍 Checking for updates…")
+
+    # Fetch latest refs
+    proc = await asyncio.create_subprocess_exec(
+        "git", "fetch", "origin",
+        cwd=bot_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        await msg.edit_text(
+            f"git fetch failed:\n<pre>{html.escape(stderr.decode()[:500])}</pre>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Count commits we're behind
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-list", "HEAD..FETCH_HEAD", "--count",
+        cwd=bot_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        count = int(stdout.decode().strip())
+    except ValueError:
+        count = 0
+
+    if count == 0:
+        await msg.edit_text("✅ Already up to date.")
+        return
+
+    # Show changelog
+    proc = await asyncio.create_subprocess_exec(
+        "git", "log", "HEAD..FETCH_HEAD",
+        "--oneline", "--no-decorate",
+        cwd=bot_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    changelog = stdout.decode().strip()
+
+    lines = [
+        f"🆕 <b>{count} update(s) available</b>",
+        "",
+        f"<pre>{html.escape(changelog[:800])}</pre>",
+    ]
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "⬆️ Update & Restart",
+            callback_data="update:confirm",
+        ),
+        InlineKeyboardButton(
+            "✖ Cancel",
+            callback_data="update:cancel",
+        ),
+    ]])
+    await msg.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=buttons,
+    )
+
+
 @cmd("feedback", "<text> | list | done <id> | rm <id>")
 async def cmd_feedback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1012,6 +1087,72 @@ async def callback_mcp(
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(buttons),
         )
+
+
+async def callback_update(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle Update & Restart / Cancel button."""
+    cq = update.callback_query
+    if cq.from_user.id != ADMIN_CHAT_ID:
+        await cq.answer("Unauthorized")
+        return
+
+    action = cq.data.split(":", 1)[1]
+
+    if action == "cancel":
+        await cq.answer("Cancelled")
+        await cq.edit_message_text("Update cancelled.")
+        return
+
+    await cq.answer("Pulling…")
+    await cq.edit_message_text("⬆️ Pulling updates…")
+
+    bot_dir = Path(__file__).parent
+
+    proc = await asyncio.create_subprocess_exec(
+        "git", "pull", "--ff-only",
+        cwd=bot_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    pull_out = (stdout + stderr).decode().strip()
+
+    if proc.returncode != 0:
+        await cq.message.reply_text(
+            f"❌ git pull failed:\n"
+            f"<pre>{html.escape(pull_out[:500])}</pre>",
+            parse_mode="HTML",
+        )
+        return
+
+    await cq.edit_message_text(
+        f"✅ Pulled.\n<pre>{html.escape(pull_out[:400])}</pre>"
+        "\n\nSyncing deps…",
+        parse_mode="HTML",
+    )
+
+    # uv sync — skip silently if uv not available or in Docker
+    if (bot_dir / "pyproject.toml").exists():
+        proc = await asyncio.create_subprocess_exec(
+            "uv", "sync",
+            cwd=bot_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+    await cq.message.reply_text("♻️ Restarting…")
+
+    # Release PID file so the new process can acquire it
+    _PID_FILE.unlink(missing_ok=True)
+
+    # Re-exec: replace current process with a fresh one
+    os.execv(
+        sys.executable,
+        [sys.executable, str(Path(__file__).resolve())],
+    )
 
 
 async def callback_quick_reply(
@@ -1509,6 +1650,11 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             callback_mcp, pattern=r"^mcp:"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            callback_update, pattern=r"^update:"
         )
     )
     app.add_handler(

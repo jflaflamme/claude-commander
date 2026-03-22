@@ -66,11 +66,41 @@ fi
 echo ""
 echo "Installation complete!"
 echo ""
-echo "To start:"
-echo "  cd $INSTALL_DIR"
-echo "  # Edit .env with your credentials"
-echo "  uv run python bot.py"
-echo ""
+
+# --- systemd user service setup ---
+if command -v systemctl &>/dev/null; then
+    SERVICE_DIR="$HOME/.config/systemd/user"
+    SERVICE_FILE="$SERVICE_DIR/claude-commander.service"
+    mkdir -p "$SERVICE_DIR"
+
+    sed "s|{INSTALL_DIR}|$INSTALL_DIR|g" \
+        "$INSTALL_DIR/claude-commander.service" \
+        > "$SERVICE_FILE"
+    chmod 644 "$SERVICE_FILE"
+
+    systemctl --user daemon-reload
+    systemctl --user enable claude-commander.service
+
+    echo "systemd service installed and enabled."
+    echo ""
+    echo "Edit your credentials, then start:"
+    echo "  nano $INSTALL_DIR/.env"
+    echo "  systemctl --user start claude-commander.service"
+    echo ""
+    echo "To auto-start at boot without login (run once, needs sudo):"
+    echo "  sudo loginctl enable-linger $USER"
+    echo ""
+    echo "To update later, just send /update to your bot."
+    echo ""
+else
+    echo "To start:"
+    echo "  cd $INSTALL_DIR"
+    echo "  # Edit .env with your credentials"
+    echo "  uv run python bot.py"
+    echo ""
+fi
+
 echo "Or with Docker:"
 echo "  cd $INSTALL_DIR"
 echo "  docker compose up --build -d"
+echo ""
