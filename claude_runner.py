@@ -14,8 +14,9 @@ import db
 
 logger = logging.getLogger(__name__)
 
-# Telegram message limit
+# Message length limits
 TG_MAX_LEN = 4096
+DISCORD_MAX_LEN = 2000
 
 # Timeout for a single prompt (5 minutes)
 PROMPT_TIMEOUT = 300

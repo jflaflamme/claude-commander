@@ -56,6 +56,15 @@ def init_db() -> None:
             status TEXT DEFAULT 'open',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS discord_bindings (
+            discord_id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL CHECK(scope IN ('guild', 'category', 'channel', 'thread')),
+            project_name TEXT,
+            session_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_name) REFERENCES projects(name)
+        );
     """)
     conn.commit()
     conn.close()
@@ -333,3 +342,91 @@ def delete_feedback(feedback_id: int) -> bool:
     conn.commit()
     conn.close()
     return cursor.rowcount > 0
+
+
+# --- Discord Bindings ---
+
+
+def set_discord_binding(
+    discord_id: str,
+    scope: str,
+    project_name: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO discord_bindings "
+        "(discord_id, scope, project_name, session_id) VALUES (?, ?, ?, ?)",
+        (discord_id, scope, project_name, session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_discord_binding(discord_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM discord_bindings WHERE discord_id = ?",
+        (discord_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_discord_session(discord_id: str, session_id: str) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE discord_bindings SET session_id = ? WHERE discord_id = ?",
+        (session_id, discord_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_discord_binding(discord_id: str) -> bool:
+    conn = get_conn()
+    cursor = conn.execute(
+        "DELETE FROM discord_bindings WHERE discord_id = ?",
+        (discord_id,),
+    )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
+
+
+def list_discord_bindings(guild_id: str | None = None) -> list[dict]:
+    conn = get_conn()
+    if guild_id:
+        rows = conn.execute(
+            "SELECT * FROM discord_bindings WHERE discord_id = ? "
+            "OR discord_id LIKE ? ORDER BY scope",
+            (guild_id, f"{guild_id}:%"),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM discord_bindings ORDER BY scope"
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def resolve_discord_binding(
+    thread_id: str | None,
+    channel_id: str | None,
+    category_id: str | None,
+    guild_id: str | None,
+) -> dict | None:
+    """Walk up Discord hierarchy to find first binding."""
+    conn = get_conn()
+    for did in [thread_id, channel_id, category_id, guild_id]:
+        if not did:
+            continue
+        row = conn.execute(
+            "SELECT * FROM discord_bindings WHERE discord_id = ?",
+            (did,),
+        ).fetchone()
+        if row:
+            conn.close()
+            return dict(row)
+    conn.close()
+    return None
