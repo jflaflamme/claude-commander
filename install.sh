@@ -37,9 +37,28 @@ fi
 
 # Clone or update
 if [ -d "$INSTALL_DIR" ]; then
-    echo "Updating existing installation at $INSTALL_DIR..."
-    cd "$INSTALL_DIR"
-    git pull --ff-only
+    echo "Existing installation found at $INSTALL_DIR"
+    echo ""
+    printf "  [U] Update (git pull + sync deps)  [R] Reinstall  [A] Abort  [U]: "
+    read -r ACTION </dev/tty || ACTION="U"
+    ACTION="${ACTION:-U}"
+    case "${ACTION^^}" in
+        U)
+            echo "Updating..."
+            cd "$INSTALL_DIR"
+            git pull --ff-only
+            ;;
+        R)
+            echo "Reinstalling..."
+            rm -rf "$INSTALL_DIR"
+            git clone "https://github.com/$REPO.git" "$INSTALL_DIR"
+            cd "$INSTALL_DIR"
+            ;;
+        *)
+            echo "Aborted."
+            exit 0
+            ;;
+    esac
 else
     echo "Cloning to $INSTALL_DIR..."
     git clone "https://github.com/$REPO.git" "$INSTALL_DIR"
@@ -81,14 +100,19 @@ if command -v systemctl &>/dev/null; then
     systemctl --user daemon-reload
     systemctl --user enable claude-commander.service
 
-    echo "systemd service installed and enabled."
-    echo ""
-    echo "Edit your credentials, then start:"
-    echo "  nano $INSTALL_DIR/.env"
-    echo "  systemctl --user start claude-commander.service"
-    echo ""
-    echo "To auto-start at boot without login (run once, needs sudo):"
-    echo "  sudo loginctl enable-linger $USER"
+    if systemctl --user is-active --quiet claude-commander.service; then
+        systemctl --user restart claude-commander.service
+        echo "Service updated and restarted."
+    else
+        echo "Service installed and enabled."
+        echo ""
+        echo "Edit your credentials, then start:"
+        echo "  nano $INSTALL_DIR/.env"
+        echo "  systemctl --user start claude-commander.service"
+        echo ""
+        echo "To auto-start at boot without login (run once, needs sudo):"
+        echo "  sudo loginctl enable-linger $USER"
+    fi
     echo ""
     echo "To update later, just send /update to your bot."
     echo ""
