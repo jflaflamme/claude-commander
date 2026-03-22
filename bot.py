@@ -28,14 +28,17 @@ from telegram.ext import (
 
 import db
 from claude_runner import (
+    AVAILABLE_MODELS,
     cancel_running,
     format_html,
+    get_model,
     get_mcp_servers_for_project,
     is_running,
     reset_memory,
     match_project_by_description,
     run_prompt,
     scan_projects,
+    set_model,
     split_message,
     strip_markdown,
 )
@@ -818,6 +821,36 @@ async def cmd_feedback(
     message = " ".join(args)
     fid = db.add_feedback(message)
     await update.message.reply_text(f"Feedback #{fid} saved.")
+
+
+@cmd("model", "[name] — show or switch model (opus/sonnet/haiku)")
+async def cmd_model(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not is_admin(update):
+        return
+    if not context.args:
+        current = get_model()
+        models = " | ".join(
+            f"<b>{m}</b>" if m == current else m
+            for m in AVAILABLE_MODELS
+        )
+        await update.message.reply_text(
+            f"Model: <b>{current}</b>\n\n{models}",
+            parse_mode="HTML",
+        )
+        return
+
+    name = context.args[0].lower()
+    if set_model(name):
+        await update.message.reply_text(
+            f"Model set to <b>{name}</b>.",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"Unknown model. Available: {', '.join(AVAILABLE_MODELS)}"
+        )
 
 
 # --- Shared prompt runner with cancel button ---

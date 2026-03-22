@@ -13,8 +13,9 @@ data/
 # Caches
 .ruff_cache/
 
-# IDE
+# IDE / local context
 .claude/
+CLAUDE.md
 *.swp
 *.swo
 *~

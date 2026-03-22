@@ -21,13 +21,31 @@ TG_MAX_LEN = 4096
 PROMPT_TIMEOUT = 300
 
 # Default model
-DEFAULT_MODEL = "sonnet"
+DEFAULT_MODEL = "opus"
+
+# Available models
+AVAILABLE_MODELS = ["opus", "sonnet", "haiku"]
+
+# Current active model (can be changed at runtime)
+_active_model: str = DEFAULT_MODEL
 
 # Per-project locks (one prompt at a time per project)
 _locks: dict[str, asyncio.Lock] = {}
 
 # Running subprocesses per project (for cancel support)
 _procs: dict[str, asyncio.subprocess.Process] = {}
+
+
+def get_model() -> str:
+    return _active_model
+
+
+def set_model(model: str) -> bool:
+    global _active_model
+    if model not in AVAILABLE_MODELS:
+        return False
+    _active_model = model
+    return True
 
 # Scan directories for /scan
 SCAN_DIRS = [
@@ -211,7 +229,7 @@ async def run_prompt(
         "--input-format", "stream-json",
         "--verbose",
         "--permission-mode", "bypassPermissions",
-        "--model", DEFAULT_MODEL,
+        "--model", _active_model,
     ]
 
     # MCP config
