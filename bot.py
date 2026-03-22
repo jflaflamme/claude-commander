@@ -31,13 +31,11 @@ from claude_runner import (
     cancel_running,
     format_html,
     get_mcp_servers_for_project,
+    is_running,
     reset_memory,
     match_project_by_description,
-    resolve_permission,
-    run_prompt_queued,
+    run_prompt,
     scan_projects,
-    set_telegram_bot,
-    warmup_projects,
     split_message,
     strip_markdown,
 )
@@ -47,6 +45,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logging.getLogger("claude_runner").setLevel(logging.DEBUG)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -406,6 +405,55 @@ async def cmd_remove(
         await update.message.reply_text(
             f"Project '{name}' not found."
         )
+
+
+@cmd("edit", "<name> [path=<path>] [desc=<desc>] — update project")
+async def cmd_edit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not is_admin(update):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /edit <name> [path=<new_path>] [desc=<new_description>]"
+        )
+        return
+
+    name = args[0]
+    if not db.get_project(name):
+        await update.message.reply_text(f"Unknown project: {name}")
+        return
+
+    new_cwd = None
+    new_desc = None
+    for arg in args[1:]:
+        if arg.startswith("path="):
+            new_cwd = os.path.expanduser(arg[5:])
+        elif arg.startswith("desc="):
+            new_desc = arg[5:]
+
+    if new_cwd is None and new_desc is None:
+        await update.message.reply_text(
+            "Nothing to update. Use path=<path> and/or desc=<description>."
+        )
+        return
+
+    if new_cwd and not os.path.isdir(new_cwd):
+        await update.message.reply_text(
+            f"Directory not found: {new_cwd}"
+        )
+        return
+
+    db.update_project(name, cwd=new_cwd, description=new_desc)
+    parts = []
+    if new_cwd:
+        parts.append(f"path → {new_cwd}")
+    if new_desc is not None:
+        parts.append(f"desc → {new_desc!r}")
+    await update.message.reply_text(
+        f"Project '{name}' updated: {', '.join(parts)}"
+    )
 
 
 @cmd("ask", "<project> <prompt> — send prompt")
@@ -778,7 +826,7 @@ async def cmd_feedback(
 async def _run_and_reply(
     update: Update, project_name: str, prompt: str
 ) -> None:
-    """Send status with Cancel button, run prompt, reply."""
+    """Send status message, run prompt, reply with result."""
     cancel_id = uuid.uuid4().hex[:8]
     preview = html.escape(
         prompt[:60] + ("…" if len(prompt) > 60 else "")
@@ -801,59 +849,31 @@ async def _run_and_reply(
     status_msg = await update.message.reply_text(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
-    last_status: list[str] = []
-    last_status_edit_time: list[float] = [0.0]
-    STATUS_THROTTLE_SECS = 10.0
 
-    async def on_status(label: str) -> None:
-        text = f"{base}\n\n{html.escape(label)}"
-        if last_status and last_status[0] == text:
-            return
-        now = asyncio.get_event_loop().time()
-        if now - last_status_edit_time[0] < STATUS_THROTTLE_SECS:
-            return
-        last_status[:] = [text]
-        last_status_edit_time[0] = now
-        try:
-            await status_msg.edit_text(
-                text, parse_mode="HTML", reply_markup=buttons,
-            )
-        except Exception:
-            pass
+    # Single timeout edit — if still working after 2 min, one update
+    HUNG_TIMEOUT = 120  # seconds
+    hung_edited = False
 
-    stop_heartbeat = asyncio.Event()
-    start_time = asyncio.get_event_loop().time()
-
-    async def heartbeat() -> None:
-        while not stop_heartbeat.is_set():
-            await asyncio.sleep(30)
-            if stop_heartbeat.is_set():
-                break
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            mins, secs = divmod(elapsed, 60)
-            elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            current = last_status[0] if last_status else "Clauding…"
-            text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
-            if last_status and last_status[0] == text:
-                continue
-            last_status[:] = [text]
+    async def hung_check() -> None:
+        nonlocal hung_edited
+        await asyncio.sleep(HUNG_TIMEOUT)
+        if is_running(project_name) and not hung_edited:
+            hung_edited = True
             try:
                 await status_msg.edit_text(
-                    text, parse_mode="HTML", reply_markup=buttons,
+                    f"{base}\n\nStill working (2m+)…",
+                    parse_mode="HTML", reply_markup=buttons,
                 )
             except Exception:
                 pass
 
-    heartbeat_task = asyncio.create_task(heartbeat())
+    hung_task = asyncio.create_task(hung_check())
 
-    result = await run_prompt_queued(
-        project_name, prompt, on_status
-    )
+    result = await run_prompt(project_name, prompt)
 
-    stop_heartbeat.set()
-    heartbeat_task.cancel()
+    hung_task.cancel()
     try:
-        await heartbeat_task
+        await hung_task
     except asyncio.CancelledError:
         pass
 
@@ -922,48 +942,6 @@ async def callback_switchmenu(
         await cq.edit_message_text("Switch to:", reply_markup=markup)
     except BadRequest:
         await cq.message.reply_text("Switch to:", reply_markup=markup)
-
-
-async def callback_permission(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    cq = update.callback_query
-    if cq.from_user.id != ADMIN_CHAT_ID:
-        await cq.answer("Unauthorized")
-        return
-
-    parts = cq.data.split(":", 3)
-    if len(parts) < 3:
-        await cq.answer("Invalid")
-        return
-
-    action = parts[1]
-    request_id = parts[2]
-
-    if action == "a" and len(parts) == 4:
-        tool_name = parts[3]
-        db.allow_tool(tool_name)
-        resolved = resolve_permission(request_id, True)
-        if resolved:
-            await cq.answer(f"Always: {tool_name}")
-            original = cq.message.text or ""
-            await cq.edit_message_text(
-                f"{original}\n\n-> Always Allowed"
-            )
-        else:
-            await cq.answer("Expired")
-    else:
-        allowed = action == "y"
-        resolved = resolve_permission(request_id, allowed)
-        if resolved:
-            label = "Allowed" if allowed else "Denied"
-            await cq.answer(label)
-            original = cq.message.text or ""
-            await cq.edit_message_text(
-                f"{original}\n\n-> {label}"
-            )
-        else:
-            await cq.answer("Expired")
 
 
 async def callback_cancel(
@@ -1207,66 +1185,16 @@ async def callback_quick_reply(
     status_msg = await cq.message.reply_text(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
-    last_status: list[str] = []
-    last_status_edit_time: list[float] = [0.0]
-    STATUS_THROTTLE_SECS = 10.0
 
-    async def on_status(label: str) -> None:
-        text = f"{base}\n\n{html.escape(label)}"
-        if last_status and last_status[0] == text:
-            return
-        now = asyncio.get_event_loop().time()
-        if now - last_status_edit_time[0] < STATUS_THROTTLE_SECS:
-            return
-        last_status[:] = [text]
-        last_status_edit_time[0] = now
-        try:
-            await status_msg.edit_text(
-                text, parse_mode="HTML", reply_markup=buttons,
-            )
-        except Exception:
-            pass
-
-    stop_heartbeat = asyncio.Event()
-    start_time = asyncio.get_event_loop().time()
-
-    async def heartbeat() -> None:
-        while not stop_heartbeat.is_set():
-            await asyncio.sleep(30)
-            if stop_heartbeat.is_set():
-                break
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            mins, secs = divmod(elapsed, 60)
-            elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            current = last_status[0] if last_status else "Clauding…"
-            text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
-            if last_status and last_status[0] == text:
-                continue
-            last_status[:] = [text]
-            try:
-                await status_msg.edit_text(
-                    text, parse_mode="HTML", reply_markup=buttons,
-                )
-            except Exception:
-                pass
-
-    heartbeat_task = asyncio.create_task(heartbeat())
-
-    result = await run_prompt_queued(
-        project_name, prompt, on_status
-    )
-
-    stop_heartbeat.set()
-    heartbeat_task.cancel()
-    try:
-        await heartbeat_task
-    except asyncio.CancelledError:
-        pass
+    result = await run_prompt(project_name, prompt)
 
     try:
         await status_msg.delete()
     except Exception:
         pass
+
+    if result == "Cancelled.":
+        return
 
     formatted = format_html(result)
     chunks = split_message(formatted)
@@ -1646,11 +1574,6 @@ def main() -> None:
     # Callbacks (order matters — more specific first)
     app.add_handler(
         CallbackQueryHandler(
-            callback_permission, pattern=r"^perm:"
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(
             callback_cancel, pattern=r"^cancel:"
         )
     )
@@ -1709,14 +1632,6 @@ def main() -> None:
             filters.COMMAND, handle_unknown_command
         )
     )
-
-    set_telegram_bot(app.bot, ADMIN_CHAT_ID)
-
-    async def post_init(application):
-        logger.info("Warming up projects in background...")
-        asyncio.create_task(warmup_projects())
-
-    app.post_init = post_init
 
     logger.info("Claude Commander starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

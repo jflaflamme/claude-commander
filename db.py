@@ -8,12 +8,15 @@ def get_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db() -> None:
     conn = get_conn()
     conn.executescript("""
+        PRAGMA journal_mode = WAL;
+
         CREATE TABLE IF NOT EXISTS projects (
             name TEXT PRIMARY KEY,
             cwd TEXT NOT NULL,
@@ -68,8 +71,40 @@ def add_project(name: str, cwd: str, description: str = "") -> None:
     conn.close()
 
 
+def update_project(
+    name: str,
+    cwd: str | None = None,
+    description: str | None = None,
+) -> bool:
+    """Update path and/or description without resetting created_at."""
+    if cwd is None and description is None:
+        return False
+    conn = get_conn()
+    if cwd is not None and description is not None:
+        cursor = conn.execute(
+            "UPDATE projects SET cwd = ?, description = ? WHERE name = ?",
+            (cwd, description, name),
+        )
+    elif cwd is not None:
+        cursor = conn.execute(
+            "UPDATE projects SET cwd = ? WHERE name = ?",
+            (cwd, name),
+        )
+    else:
+        cursor = conn.execute(
+            "UPDATE projects SET description = ? WHERE name = ?",
+            (description, name),
+        )
+    conn.commit()
+    conn.close()
+    return cursor.rowcount > 0
+
+
 def remove_project(name: str) -> bool:
     conn = get_conn()
+    # Clean up related records first (FK cascade not reliable on all SQLite builds)
+    conn.execute("DELETE FROM sessions WHERE project_name = ?", (name,))
+    conn.execute("DELETE FROM project_mcp WHERE project_name = ?", (name,))
     cursor = conn.execute("DELETE FROM projects WHERE name = ?", (name,))
     conn.commit()
     conn.close()
@@ -81,9 +116,13 @@ def list_projects() -> list[dict]:
     rows = conn.execute(
         """
         SELECT p.name, p.cwd, p.description,
-               s.session_id, s.last_used
+               (SELECT session_id FROM sessions
+                WHERE project_name = p.name AND active = 1
+                ORDER BY last_used DESC LIMIT 1) AS session_id,
+               (SELECT last_used FROM sessions
+                WHERE project_name = p.name AND active = 1
+                ORDER BY last_used DESC LIMIT 1) AS last_used
         FROM projects p
-        LEFT JOIN sessions s ON s.project_name = p.name AND s.active = 1
         ORDER BY p.name
         """
     ).fetchall()

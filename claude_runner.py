@@ -1,19 +1,14 @@
-"""Claude Agent SDK wrapper — persistent sessions via ClaudeSDKClient."""
+"""Claude CLI wrapper — direct subprocess via stream-json protocol."""
 
 import asyncio
 import html
 import json
 import logging
 import re
+import tempfile
+from asyncio.subprocess import PIPE
 from pathlib import Path
 from typing import Any, Callable
-
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    SystemMessage,
-)
 
 import db
 
@@ -28,21 +23,11 @@ PROMPT_TIMEOUT = 300
 # Default model
 DEFAULT_MODEL = "sonnet"
 
-# Per-project persistent clients
-_clients: dict[str, ClaudeSDKClient] = {}
+# Per-project locks (one prompt at a time per project)
+_locks: dict[str, asyncio.Lock] = {}
 
-# Per-project connection locks — prevent duplicate connect races
-_connect_locks: dict[str, asyncio.Lock] = {}
-
-# Running tasks per project (for cancel support)
-_running_tasks: dict[str, asyncio.Task] = {}
-
-# Pending permission requests: request_id -> Future[bool]
-_pending_permissions: dict[str, asyncio.Future] = {}
-
-# Telegram bot reference (set by bot.py at startup)
-_tg_bot = None
-_tg_chat_id: int = 0
+# Running subprocesses per project (for cancel support)
+_procs: dict[str, asyncio.subprocess.Process] = {}
 
 # Scan directories for /scan
 SCAN_DIRS = [
@@ -102,71 +87,49 @@ def _interpret_prompt(prompt: str) -> str | None:
     return f"[{' | '.join(parts)}]"
 
 
-def _message_label(message: Any) -> str | None:
-    """Extract a short label from an intermediate SDK message."""
-    tool = (
-        getattr(message, "tool_name", None)
-        or getattr(message, "name", None)
-    )
-    if not tool:
-        content = getattr(message, "content", None)
-        if isinstance(content, str) and content.strip():
-            return f"→ {content.strip()[:60]}"
+def _extract_label(data: dict) -> str | None:
+    """Extract a short status label from a stream-json assistant message."""
+    message = data.get("message", {})
+    content = message.get("content", [])
+    if isinstance(content, str):
+        stripped = content.strip()
+        if stripped:
+            return f"→ {stripped[:60]}"
         return None
 
-    inp = getattr(message, "tool_input", None) or {}
+    for block in content:
+        if block.get("type") != "tool_use":
+            continue
+        tool = block.get("name", "")
+        inp = block.get("input", {})
 
-    if tool == "Bash":
-        cmd = inp.get("command", "")
-        if cmd:
-            return f"→ Bash: {cmd[:72]}"
-    elif tool in ("Write", "Edit", "Read"):
-        path = inp.get("file_path", "")
-        if path:
-            return f"→ {tool}: {Path(path).name}"
-    elif tool == "Grep":
-        pattern = inp.get("pattern", "")
-        if pattern:
-            return f"→ Grep: {pattern[:60]}"
-    elif tool == "Glob":
-        pattern = inp.get("pattern", "")
-        if pattern:
-            return f"→ Glob: {pattern[:60]}"
-    elif tool.startswith("mcp__"):
-        # mcp__joplin__get_note → joplin: get_note
-        parts = tool.split("__")
-        if len(parts) >= 3:
-            return f"→ {parts[1]}: {parts[2]}"
+        if tool == "Bash":
+            cmd = inp.get("command", "")
+            if cmd:
+                return f"→ Bash: {cmd[:72]}"
+        elif tool in ("Write", "Edit", "Read"):
+            path = inp.get("file_path", "")
+            if path:
+                return f"→ {tool}: {Path(path).name}"
+        elif tool == "Grep":
+            pattern = inp.get("pattern", "")
+            if pattern:
+                return f"→ Grep: {pattern[:60]}"
+        elif tool == "Glob":
+            pattern = inp.get("pattern", "")
+            if pattern:
+                return f"→ Glob: {pattern[:60]}"
+        elif tool.startswith("mcp__"):
+            parts = tool.split("__")
+            if len(parts) >= 3:
+                return f"→ {parts[1]}: {parts[2]}"
 
-    return f"→ {tool}"
+        return f"→ {tool}"
 
-
-def set_telegram_bot(bot, chat_id: int) -> None:
-    global _tg_bot, _tg_chat_id
-    _tg_bot = bot
-    _tg_chat_id = chat_id
-
-
-def resolve_permission(request_id: str, allowed: bool) -> bool:
-    future = _pending_permissions.pop(request_id, None)
-    if future and not future.done():
-        future.set_result(allowed)
-        return True
-    return False
+    return None
 
 
-def cancel_running(project_name: str) -> bool:
-    task = _running_tasks.pop(project_name, None)
-    if task and not task.done():
-        task.cancel()
-        # Disconnect the client to kill the subprocess immediately
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(reset_client(project_name))
-        except RuntimeError:
-            pass
-        return True
-    return False
+# --- MCP config ---
 
 
 def _find_mcp_config(cwd: str) -> Path | None:
@@ -213,87 +176,19 @@ def _load_filtered_mcp(
     return filtered or None
 
 
-def _build_options(
-    cwd: str, project_name: str = "",
-) -> ClaudeAgentOptions:
-    opts = ClaudeAgentOptions(
-        cwd=cwd,
-        permission_mode="bypassPermissions",
-        setting_sources=["user", "project"],
-        model=DEFAULT_MODEL,
+def _write_mcp_tempfile(mcp_servers: dict) -> Path:
+    """Write MCP config to a temp file for --mcp-config flag."""
+    data = {"mcpServers": mcp_servers}
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="mcp_",
+        delete=False,
     )
-    if project_name:
-        mcp = _load_filtered_mcp(project_name, cwd)
-        if mcp:
-            opts.mcp_servers = mcp
-    else:
-        mcp_path = _find_mcp_config(cwd)
-        if mcp_path:
-            opts.mcp_servers = mcp_path
-    return opts
+    json.dump(data, tmp)
+    tmp.close()
+    return Path(tmp.name)
 
 
-async def _get_client(
-    project_name: str, cwd: str
-) -> ClaudeSDKClient:
-    """Get or create a persistent client for a project."""
-    if project_name in _clients:
-        return _clients[project_name]
-
-    if project_name not in _connect_locks:
-        _connect_locks[project_name] = asyncio.Lock()
-
-    async with _connect_locks[project_name]:
-        # Re-check after acquiring lock — another caller may have connected
-        if project_name in _clients:
-            return _clients[project_name]
-
-        logger.info("[%s] Connecting...", project_name)
-        opts = _build_options(cwd, project_name)
-        client = ClaudeSDKClient(options=opts)
-        await client.connect()
-        _clients[project_name] = client
-
-        if isinstance(opts.mcp_servers, dict) and opts.mcp_servers:
-            mcp_names = ", ".join(opts.mcp_servers.keys())
-            logger.info(
-                "[%s] Loaded — MCP: %s", project_name, mcp_names
-            )
-        else:
-            logger.info("[%s] Loaded — no MCP", project_name)
-
-    return _clients[project_name]
-
-
-async def disconnect_client(project_name: str) -> None:
-    """Disconnect and remove a project's client."""
-    client = _clients.pop(project_name, None)
-    if client:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        logger.info("[%s] Client disconnected", project_name)
-
-
-async def reset_client(project_name: str) -> None:
-    """Reset: disconnect and clear session."""
-    await disconnect_client(project_name)
-    db.reset_session(project_name)
-
-
-async def warmup_projects() -> None:
-    """Pre-connect clients for all registered projects."""
-    projects = db.list_projects()
-    for p in projects:
-        name = p["name"]
-        cwd = p["cwd"]
-        try:
-            await _get_client(name, cwd)
-        except Exception as e:
-            logger.warning(
-                "[%s] Warmup failed: %s", name, e
-            )
+# --- Core: subprocess prompt execution ---
 
 
 async def run_prompt(
@@ -301,156 +196,136 @@ async def run_prompt(
     prompt: str,
     on_status: Callable[[str], Any] | None = None,
 ) -> str:
-    """Send a prompt to a persistent client."""
+    """Send prompt to claude CLI subprocess, return result."""
     project = db.get_project(project_name)
     if not project:
         return f"Project '{project_name}' not found."
 
     cwd = project["cwd"]
+    session_id = db.get_active_session(project_name) or ""
 
-    try:
-        client = await _get_client(project_name, cwd)
-    except Exception as e:
-        logger.exception(
-            "[%s] Failed to connect", project_name
-        )
-        return f"Connection error: {e}"
+    # Build CLI command
+    cmd = [
+        "claude",
+        "--output-format", "stream-json",
+        "--input-format", "stream-json",
+        "--verbose",
+        "--permission-mode", "bypassPermissions",
+        "--model", DEFAULT_MODEL,
+    ]
+
+    # MCP config
+    mcp = _load_filtered_mcp(project_name, cwd)
+    mcp_tmpfile = None
+    if mcp:
+        mcp_tmpfile = _write_mcp_tempfile(mcp)
+        cmd += ["--mcp-config", str(mcp_tmpfile)]
+
+    # Resume session if exists
+    if session_id:
+        cmd += ["--resume", session_id]
 
     preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
     logger.info("[%s] Prompt: %s", project_name, preview)
 
+    # Add interpretation prefix
     interp = _interpret_prompt(prompt)
     if interp:
         logger.debug("[%s] Interpretation: %s", project_name, interp)
         prompt = f"{interp}\n{prompt}"
 
-    async def _emit(label: str) -> None:
-        if on_status:
-            try:
-                await on_status(label)
-            except Exception:
-                pass
-
-    try:
-        await client.query(prompt)
-
-        result_text = ""
-        async for message in client.receive_response():
-            if isinstance(message, SystemMessage):
-                if message.subtype == "init":
-                    sid = message.data.get("session_id")
-                    if sid:
-                        db.save_session(project_name, sid)
-            elif isinstance(message, ResultMessage):
-                result_text = message.result or "(no output)"
-                logger.info(
-                    "[%s] Result (%d chars)",
-                    project_name, len(result_text),
-                )
-            else:
-                label = _message_label(message)
-                if label:
-                    logger.debug(
-                        "[%s] Event: %s", project_name, label
-                    )
-                    await _emit(label)
-
-        db.touch_session(project_name)
-        return result_text
-
-    except asyncio.CancelledError:
-        logger.info("[%s] Cancelled", project_name)
-        return "Cancelled."
-    except Exception as e:
-        logger.warning(
-            "[%s] Error: %s — reconnecting", project_name, e
-        )
-        await disconnect_client(project_name)
+    # Acquire per-project lock (queuing)
+    lock = _locks.setdefault(project_name, asyncio.Lock())
+    async with lock:
         try:
-            client = await _get_client(project_name, cwd)
-            await client.query(prompt)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, cwd=cwd,
+            )
+            _procs[project_name] = proc
+
+            # Send prompt on stdin
+            msg = json.dumps({
+                "type": "user",
+                "session_id": session_id,
+                "message": {"role": "user", "content": prompt},
+                "parent_tool_use_id": None,
+            })
+            proc.stdin.write(msg.encode() + b"\n")
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+            # Read stdout line by line
             result_text = ""
-            async for message in client.receive_response():
-                if isinstance(message, ResultMessage):
-                    result_text = (
-                        message.result or "(no output)"
+            async for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.debug("[%s] Non-JSON line: %s", project_name, line[:100])
+                    continue
+
+                msg_type = data.get("type")
+                if msg_type == "result":
+                    result_text = data.get("result") or "(no output)"
+                    new_sid = data.get("session_id")
+                    if new_sid:
+                        db.save_session(project_name, new_sid)
+                    db.touch_session(project_name)
+                    is_error = data.get("is_error", False)
+                    if is_error:
+                        logger.warning("[%s] Claude returned error", project_name)
+                    logger.info(
+                        "[%s] Result (%d chars)",
+                        project_name, len(result_text),
                     )
-                else:
-                    label = _message_label(message)
+                elif msg_type == "assistant" and on_status:
+                    label = _extract_label(data)
                     if label:
-                        await _emit(label)
-            db.touch_session(project_name)
-            return result_text
-        except Exception as retry_err:
-            logger.exception(
-                "[%s] Retry failed", project_name
-            )
-            return f"Error: {retry_err}"
+                        logger.debug("[%s] Event: %s", project_name, label)
+                        try:
+                            await on_status(label)
+                        except Exception:
+                            pass
+
+            await proc.wait()
+            return result_text or "(no output)"
+
+        except asyncio.CancelledError:
+            logger.info("[%s] Cancelled", project_name)
+            return "Cancelled."
+        except Exception as e:
+            logger.exception("[%s] Error: %s", project_name, e)
+            return f"Error: {e}"
+        finally:
+            _procs.pop(project_name, None)
+            if mcp_tmpfile:
+                try:
+                    mcp_tmpfile.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
-# Per-project prompt queues
-_queues: dict[str, asyncio.Queue] = {}
+def cancel_running(project_name: str) -> bool:
+    """Cancel a running prompt by terminating the subprocess."""
+    proc = _procs.pop(project_name, None)
+    if proc and proc.returncode is None:
+        proc.terminate()
+        logger.info("[%s] Subprocess terminated", project_name)
+        return True
+    return False
 
 
-def _get_queue(project_name: str) -> asyncio.Queue:
-    if project_name not in _queues:
-        _queues[project_name] = asyncio.Queue()
-    return _queues[project_name]
-
-
-async def run_prompt_queued(
-    project_name: str,
-    prompt: str,
-    on_status: Callable[[str], Any] | None = None,
-) -> str:
-    """Queue-wrapped run_prompt with cancel support."""
-    q = _get_queue(project_name)
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future = loop.create_future()
-    await q.put((prompt, future, on_status))
-
-    if not getattr(q, "_worker_running", False):
-        q._worker_running = True
-        asyncio.create_task(_queue_worker(project_name, q))
-
-    return await future
-
-
-async def _queue_worker(
-    project_name: str, q: asyncio.Queue
-) -> None:
-    try:
-        while True:
-            try:
-                prompt, future, on_status = q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            task = asyncio.create_task(
-                run_prompt(project_name, prompt, on_status)
-            )
-            _running_tasks[project_name] = task
-            try:
-                result = await task
-                if not future.done():
-                    future.set_result(result)
-            except asyncio.CancelledError:
-                if not future.done():
-                    future.set_result("Cancelled.")
-            except Exception as e:
-                if not future.done():
-                    future.set_exception(e)
-            finally:
-                _running_tasks.pop(project_name, None)
-                q.task_done()
-    finally:
-        q._worker_running = False
+def is_running(project_name: str) -> bool:
+    """Check if a prompt is currently running for a project."""
+    proc = _procs.get(project_name)
+    return proc is not None and proc.returncode is None
 
 
 def reset_memory(project_name: str) -> None:
-    """Clear session — schedules client disconnect."""
-    asyncio.get_event_loop().create_task(
-        reset_client(project_name)
-    )
+    """Clear session for a project."""
+    db.reset_session(project_name)
 
 
 # --- Project scanning ---
