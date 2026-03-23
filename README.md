@@ -19,8 +19,9 @@ Claude Code has a native Telegram channel integration, but it's scoped to a **si
 | Switching | Start a new session manually | `/switch` or "switch to X" |
 | MCP servers | Inherited from launch env | Per-project, toggleable |
 | Voice input | No | Yes (Groq Whisper) |
+| Files & images | No | Yes (photos + any document) |
 | Session memory | Lost on disconnect | Resumed across restarts |
-| Tool approval | Terminal only | Inline Telegram buttons |
+| Tool approval | Terminal only | Inline Telegram buttons (waits for you) |
 
 **When to use the built-in channel:** you're working in one project and want a Telegram mirror of your current Claude Code terminal session.
 
@@ -214,11 +215,34 @@ Send a voice message and it's transcribed via [Groq Whisper](https://console.gro
 
 Set `GROQ_API_KEY` in your `.env` to enable it. Without it, voice messages return an error. The transcription is shown as a quote before the response so you can verify what was heard.
 
+## Files & Images
+
+Send any photo or document to the bot and it's downloaded and passed to the active project's Claude session along with the caption (if any).
+
+- **Photos** — sent directly as attached files; useful for screenshots, diagrams, UI mockups
+- **Documents** — any file type Telegram allows; Claude can read code files, CSVs, PDFs, etc.
+
+The file path is included in the prompt so Claude can read or reference it. No extra configuration needed.
+
+## Tool Permissions
+
+When Claude wants to use a tool that isn't pre-approved, the bot sends an inline keyboard to Telegram asking what to do:
+
+- **Allow once** — permits this single call and continues
+- **Always** — saves the permission to the database; future calls to the same tool are auto-approved without prompting
+- **Deny** — rejects the call and tells Claude to try a different approach
+
+The bot waits **indefinitely** for your response — designed for phone-first use where you might not reply immediately. The prompt stays paused until you tap a button, no matter how long it takes.
+
+Use `/permissions` to list and revoke saved "Always" approvals.
+
 ## Features
 
 - **Persistent sessions** — `ClaudeSDKClient` keeps subprocesses warm, near-instant responses after first connect
 - **Conversation memory** — full chat history within each project session
 - **Voice input** — voice messages transcribed via Groq Whisper and sent as prompts
+- **File & image input** — send photos or documents; Claude receives the file path and can read/reference them
+- **Tool permission prompts** — Bash and other tools send Allow/Deny/Always buttons to Telegram; waits indefinitely for your response
 - **Project scanning** — `/scan` finds projects in common directories by detecting `.git`, `.mcp.json`, `pyproject.toml`, etc.
 - **Auto-routing** — plain text matches against project descriptions to pick the right project
 - **Natural language switch** — "switch to X" or "use X" works like `/switch X`
@@ -236,9 +260,8 @@ Set `GROQ_API_KEY` in your `.env` to enable it. Without it, voice messages retur
 
 ## Security
 
-> **This bot runs Claude with `bypassPermissions` mode.** Claude can read, write, and execute code in any mounted project directory without asking. This is by design for speed — the security model relies on single-admin access.
-
 - **Single admin only** — every handler checks `ADMIN_CHAT_ID`. Unauthorized users get no response.
+- **Tool permission prompts** — Claude runs in `acceptEdits` mode. File reads/edits are auto-approved; Bash commands and other tools send an inline Telegram prompt (Allow once / Always / Deny) before executing.
 - **No credentials in code** — `.env` is gitignored. Never commit it.
 - **MCP access control** — per-project MCP server allow/deny via `/mcp`
 - **Project isolation** — each project runs in its own persistent session

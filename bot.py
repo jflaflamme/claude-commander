@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,6 +29,7 @@ from telegram.ext import (
 import db
 from claude_runner import (
     cancel_running,
+    disconnect_client,
     format_html,
     get_mcp_servers_for_project,
     reset_memory,
@@ -40,6 +41,7 @@ from claude_runner import (
     warmup_projects,
     split_message,
     strip_markdown,
+    _clients,
 )
 
 logging.basicConfig(
@@ -802,25 +804,35 @@ async def _run_and_reply(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
     last_status: list[str] = []
+    _last_edit: list[float] = [0.0]
+
+    async def _edit_status(text: str) -> None:
+        now = asyncio.get_event_loop().time()
+        if now - _last_edit[0] < 3.0:
+            return
+        _last_edit[0] = now
+        try:
+            await status_msg.edit_text(
+                text, parse_mode="HTML", reply_markup=buttons,
+            )
+        except RetryAfter as e:
+            _last_edit[0] = now + e.retry_after
+        except Exception:
+            pass
 
     async def on_status(label: str) -> None:
         text = f"{base}\n\n{html.escape(label)}"
         if last_status and last_status[0] == text:
             return
         last_status[:] = [text]
-        try:
-            await status_msg.edit_text(
-                text, parse_mode="HTML", reply_markup=buttons,
-            )
-        except Exception:
-            pass
+        await _edit_status(text)
 
     stop_heartbeat = asyncio.Event()
     start_time = asyncio.get_event_loop().time()
 
     async def heartbeat() -> None:
         while not stop_heartbeat.is_set():
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
             if stop_heartbeat.is_set():
                 break
             elapsed = int(asyncio.get_event_loop().time() - start_time)
@@ -828,15 +840,8 @@ async def _run_and_reply(
             elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
             current = last_status[0] if last_status else "Clauding…"
             text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
-            if last_status and last_status[0] == text:
-                continue
             last_status[:] = [text]
-            try:
-                await status_msg.edit_text(
-                    text, parse_mode="HTML", reply_markup=buttons,
-                )
-            except Exception:
-                pass
+            await _edit_status(text)
 
     heartbeat_task = asyncio.create_task(heartbeat())
 
@@ -896,7 +901,7 @@ async def callback_switchmenu(
 
     current = _active_project.get(cq.from_user.id)
     if current:
-        cancel_running(current)
+        await cancel_running(current)
         await cq.answer("Interrupted")
     else:
         await cq.answer()
@@ -933,6 +938,8 @@ async def callback_permission(
 
     action = parts[1]
     request_id = parts[2]
+
+    logger.info("callback_permission: action=%s id=%s", action, request_id)
 
     if action == "a" and len(parts) == 4:
         tool_name = parts[3]
@@ -976,7 +983,8 @@ async def callback_cancel(
         return
 
     project_name = parts[1]
-    if cancel_running(project_name):
+    logger.info("Cancel button pressed for project: %s", project_name)
+    if await cancel_running(project_name):
         await cq.answer("Cancelled")
         try:
             await cq.edit_message_text(f"Cancelled {project_name}.")
@@ -1202,25 +1210,35 @@ async def callback_quick_reply(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
     last_status: list[str] = []
+    _last_edit: list[float] = [0.0]
+
+    async def _edit_status(text: str) -> None:
+        now = asyncio.get_event_loop().time()
+        if now - _last_edit[0] < 3.0:
+            return
+        _last_edit[0] = now
+        try:
+            await status_msg.edit_text(
+                text, parse_mode="HTML", reply_markup=buttons,
+            )
+        except RetryAfter as e:
+            _last_edit[0] = now + e.retry_after
+        except Exception:
+            pass
 
     async def on_status(label: str) -> None:
         text = f"{base}\n\n{html.escape(label)}"
         if last_status and last_status[0] == text:
             return
         last_status[:] = [text]
-        try:
-            await status_msg.edit_text(
-                text, parse_mode="HTML", reply_markup=buttons,
-            )
-        except Exception:
-            pass
+        await _edit_status(text)
 
     stop_heartbeat = asyncio.Event()
     start_time = asyncio.get_event_loop().time()
 
     async def heartbeat() -> None:
         while not stop_heartbeat.is_set():
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
             if stop_heartbeat.is_set():
                 break
             elapsed = int(asyncio.get_event_loop().time() - start_time)
@@ -1228,15 +1246,8 @@ async def callback_quick_reply(
             elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
             current = last_status[0] if last_status else "Clauding…"
             text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
-            if last_status and last_status[0] == text:
-                continue
             last_status[:] = [text]
-            try:
-                await status_msg.edit_text(
-                    text, parse_mode="HTML", reply_markup=buttons,
-                )
-            except Exception:
-                pass
+            await _edit_status(text)
 
     heartbeat_task = asyncio.create_task(heartbeat())
 
@@ -1622,7 +1633,7 @@ def main() -> None:
     atexit.register(_release_pid)
 
     db.init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     # /start alias
     app.add_handler(CommandHandler("start", cmd_help))
@@ -1704,7 +1715,15 @@ def main() -> None:
         logger.info("Warming up projects in background...")
         asyncio.create_task(warmup_projects())
 
+    async def post_shutdown(application):
+        names = list(_clients.keys())
+        if names:
+            logger.info("Disconnecting %d SDK client(s)...", len(names))
+            for name in names:
+                await disconnect_client(name)
+
     app.post_init = post_init
+    app.post_shutdown = post_shutdown
 
     logger.info("Claude Commander starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

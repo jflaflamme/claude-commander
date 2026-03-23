@@ -5,15 +5,26 @@ import html
 import json
 import logging
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+import anyio
+
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SystemMessage,
+    TaskProgressMessage,
+    TextBlock,
+    ToolUseBlock,
 )
+from claude_agent_sdk.types import ToolPermissionContext
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import db
 
@@ -37,8 +48,9 @@ _connect_locks: dict[str, asyncio.Lock] = {}
 # Running tasks per project (for cancel support)
 _running_tasks: dict[str, asyncio.Task] = {}
 
-# Pending permission requests: request_id -> Future[bool]
-_pending_permissions: dict[str, asyncio.Future] = {}
+# Pending permission requests: request_id -> (resolve_fn, anyio.Event)
+# Uses anyio.Event for compatibility with the SDK's anyio task groups
+_pending_permissions: dict[str, tuple[Callable, anyio.Event]] = {}
 
 # Telegram bot reference (set by bot.py at startup)
 _tg_bot = None
@@ -102,20 +114,8 @@ def _interpret_prompt(prompt: str) -> str | None:
     return f"[{' | '.join(parts)}]"
 
 
-def _message_label(message: Any) -> str | None:
-    """Extract a short label from an intermediate SDK message."""
-    tool = (
-        getattr(message, "tool_name", None)
-        or getattr(message, "name", None)
-    )
-    if not tool:
-        content = getattr(message, "content", None)
-        if isinstance(content, str) and content.strip():
-            return f"→ {content.strip()[:60]}"
-        return None
-
-    inp = getattr(message, "tool_input", None) or {}
-
+def _label_from_tool(tool: str, inp: dict) -> str:
+    """Build a short status label from a tool name and its input."""
     if tool == "Bash":
         cmd = inp.get("command", "")
         if cmd:
@@ -133,11 +133,9 @@ def _message_label(message: Any) -> str | None:
         if pattern:
             return f"→ Glob: {pattern[:60]}"
     elif tool.startswith("mcp__"):
-        # mcp__joplin__get_note → joplin: get_note
         parts = tool.split("__")
         if len(parts) >= 3:
             return f"→ {parts[1]}: {parts[2]}"
-
     return f"→ {tool}"
 
 
@@ -148,24 +146,40 @@ def set_telegram_bot(bot, chat_id: int) -> None:
 
 
 def resolve_permission(request_id: str, allowed: bool) -> bool:
-    future = _pending_permissions.pop(request_id, None)
-    if future and not future.done():
-        future.set_result(allowed)
-        return True
+    logger.info(
+        "resolve_permission: id=%s allowed=%s pending=%s",
+        request_id, allowed, list(_pending_permissions.keys()),
+    )
+    entry = _pending_permissions.pop(request_id, None)
+    if entry is not None:
+        resolve_fn, event = entry
+        if not event.is_set():
+            resolve_fn(allowed)  # store result then set event
+            logger.info("resolve_permission: event set for %s", request_id)
+            return True
+        logger.warning("resolve_permission: event already set for %s", request_id)
+    else:
+        logger.warning("resolve_permission: no entry found for %s", request_id)
     return False
 
 
-def cancel_running(project_name: str) -> bool:
+async def cancel_running(project_name: str) -> bool:
+    task = _running_tasks.get(project_name)
+    logger.info(
+        "[%s] cancel_running: task=%s done=%s running_tasks=%s",
+        project_name,
+        task,
+        task.done() if task else "n/a",
+        list(_running_tasks.keys()),
+    )
     task = _running_tasks.pop(project_name, None)
     if task and not task.done():
+        logger.info("[%s] Cancelling task and disconnecting client", project_name)
         task.cancel()
-        # Disconnect the client to kill the subprocess immediately
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(reset_client(project_name))
-        except RuntimeError:
-            pass
+        await reset_client(project_name)
+        logger.info("[%s] Cancel complete", project_name)
         return True
+    logger.warning("[%s] cancel_running: nothing to cancel", project_name)
     return False
 
 
@@ -213,19 +227,124 @@ def _load_filtered_mcp(
     return filtered or None
 
 
+def _tool_detail(tool_name: str, tool_input: dict) -> str:
+    """Return a brief human-readable summary of what the tool wants to do."""
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        return f"<code>$ {html.escape(cmd[:120])}</code>" if cmd else ""
+    if tool_name in ("Write", "Edit", "Read"):
+        path = tool_input.get("file_path", "")
+        return f"<code>{html.escape(path[:120])}</code>" if path else ""
+    if tool_name == "Grep":
+        pattern = tool_input.get("pattern", "")
+        return f"pattern: <code>{html.escape(pattern[:80])}</code>" if pattern else ""
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__")
+        if len(parts) >= 3:
+            return f"{html.escape(parts[1])}: {html.escape(parts[2])}"
+    return ""
+
+
+def _make_can_use_tool(project_name: str) -> Callable:
+    """Create a can_use_tool callback that sends Telegram approval buttons."""
+    async def can_use_tool(
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if db.is_tool_allowed(tool_name):
+            return PermissionResultAllow()
+
+        if not _tg_bot:
+            return PermissionResultAllow()
+
+        request_id = uuid.uuid4().hex[:8]
+
+        # Use anyio.Event for compatibility with the SDK's anyio task groups.
+        # asyncio.Future + asyncio.wait_for doesn't wake up correctly inside
+        # anyio task group contexts (SDK uses _tg.start_soon internally).
+        event = anyio.Event()
+        result: list[bool] = [False]
+
+        def _resolve(allowed: bool) -> None:
+            result[0] = allowed
+            event.set()
+
+        _pending_permissions[request_id] = (_resolve, event)
+
+        detail = _tool_detail(tool_name, tool_input)
+        msg = (
+            f"🔐 <b>{html.escape(project_name)}</b> wants to use "
+            f"<code>{html.escape(tool_name)}</code>"
+        )
+        if detail:
+            msg += f"\n{detail}"
+
+        buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "Allow once", callback_data=f"perm:y:{request_id}"
+            ),
+            InlineKeyboardButton(
+                "Always", callback_data=f"perm:a:{request_id}:{tool_name}"
+            ),
+            InlineKeyboardButton(
+                "Deny", callback_data=f"perm:n:{request_id}"
+            ),
+        ]])
+
+        try:
+            await _tg_bot.send_message(
+                _tg_chat_id, msg,
+                parse_mode="HTML",
+                reply_markup=buttons,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to send permission request: %s (%s)",
+                e, type(e).__name__,
+            )
+            _pending_permissions.pop(request_id, None)
+            return PermissionResultAllow()
+
+        logger.info(
+            "[%s] Waiting for permission: tool=%s id=%s",
+            project_name, tool_name, request_id,
+        )
+        await event.wait()
+
+        logger.info(
+            "[%s] Permission resolved: tool=%s allowed=%s",
+            project_name, tool_name, result[0],
+        )
+        if result[0]:
+            return PermissionResultAllow()
+        return PermissionResultDeny(
+            message="User denied this tool call. Try a different approach.",
+            interrupt=False,
+        )
+
+    return can_use_tool
+
+
 def _build_options(
     cwd: str, project_name: str = "",
 ) -> ClaudeAgentOptions:
     opts = ClaudeAgentOptions(
         cwd=cwd,
-        permission_mode="bypassPermissions",
+        permission_mode="acceptEdits",
         setting_sources=["user", "project"],
         model=DEFAULT_MODEL,
+        include_partial_messages=True,
     )
     if project_name:
         mcp = _load_filtered_mcp(project_name, cwd)
         if mcp:
             opts.mcp_servers = mcp
+        opts.can_use_tool = _make_can_use_tool(project_name)
     else:
         mcp_path = _find_mcp_config(cwd)
         if mcp_path:
@@ -296,6 +415,44 @@ async def warmup_projects() -> None:
             )
 
 
+async def _handle_message(
+    message: Any,
+    project_name: str,
+    emit: Callable[[str], Any],
+) -> None:
+    """Dispatch SDK messages to status updates and session tracking."""
+    # TaskProgressMessage is a SystemMessage subclass — check first
+    if isinstance(message, TaskProgressMessage):
+        label = message.description or (
+            _label_from_tool(message.last_tool_name, {})
+            if message.last_tool_name else None
+        )
+        if label:
+            logger.debug("[%s] Progress: %s", project_name, label)
+            await emit(label)
+
+    elif isinstance(message, SystemMessage):
+        if message.subtype == "init":
+            sid = message.data.get("session_id")
+            if sid:
+                db.save_session(project_name, sid)
+
+    elif isinstance(message, AssistantMessage):
+        for block in message.content:
+            if isinstance(block, ToolUseBlock):
+                label = _label_from_tool(block.name, block.input)
+                logger.debug("[%s] Tool: %s", project_name, label)
+                await emit(label)
+            elif isinstance(block, TextBlock):
+                text = block.text.strip()
+                if text:
+                    first_line = text.split("\n")[0][:80]
+                    logger.debug(
+                        "[%s] Text: %s", project_name, first_line
+                    )
+                    await emit(f"→ {first_line}")
+
+
 async def run_prompt(
     project_name: str,
     prompt: str,
@@ -336,24 +493,15 @@ async def run_prompt(
 
         result_text = ""
         async for message in client.receive_response():
-            if isinstance(message, SystemMessage):
-                if message.subtype == "init":
-                    sid = message.data.get("session_id")
-                    if sid:
-                        db.save_session(project_name, sid)
-            elif isinstance(message, ResultMessage):
+            await _handle_message(
+                message, project_name, _emit
+            )
+            if isinstance(message, ResultMessage):
                 result_text = message.result or "(no output)"
                 logger.info(
                     "[%s] Result (%d chars)",
                     project_name, len(result_text),
                 )
-            else:
-                label = _message_label(message)
-                if label:
-                    logger.debug(
-                        "[%s] Event: %s", project_name, label
-                    )
-                    await _emit(label)
 
         db.touch_session(project_name)
         return result_text
@@ -371,14 +519,13 @@ async def run_prompt(
             await client.query(prompt)
             result_text = ""
             async for message in client.receive_response():
+                await _handle_message(
+                    message, project_name, _emit
+                )
                 if isinstance(message, ResultMessage):
                     result_text = (
                         message.result or "(no output)"
                     )
-                else:
-                    label = _message_label(message)
-                    if label:
-                        await _emit(label)
             db.touch_session(project_name)
             return result_text
         except Exception as retry_err:
@@ -429,11 +576,13 @@ async def _queue_worker(
                 run_prompt(project_name, prompt, on_status)
             )
             _running_tasks[project_name] = task
+            logger.info("[%s] Task registered: %s", project_name, task)
             try:
                 result = await task
                 if not future.done():
                     future.set_result(result)
             except asyncio.CancelledError:
+                logger.info("[%s] Task was cancelled", project_name)
                 if not future.done():
                     future.set_result("Cancelled.")
             except Exception as e:
