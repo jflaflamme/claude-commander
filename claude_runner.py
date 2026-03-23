@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
@@ -367,6 +368,10 @@ def _build_options(
         model=DEFAULT_MODEL,
         include_partial_messages=True,
     )
+    # USE_SUBSCRIPTION=true forces OAuth even when ANTHROPIC_API_KEY is set
+    # in the environment (e.g. needed by other tools in the same process).
+    if os.getenv("USE_SUBSCRIPTION"):
+        opts.env = {"ANTHROPIC_API_KEY": ""}
     if project_name:
         mcp = _load_filtered_mcp(project_name, cwd)
         if mcp:

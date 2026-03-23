@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ASYNC_FEEDBACK = os.getenv("ASYNC_FEEDBACK", "").lower() in ("1", "true", "yes")
 
 try:
     from groq import AsyncGroq as _AsyncGroq
@@ -803,58 +804,66 @@ async def _run_and_reply(
     status_msg = await update.message.reply_text(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
-    last_status: list[str] = []
-    _last_edit: list[float] = [0.0]
 
-    async def _edit_status(text: str) -> None:
-        now = asyncio.get_event_loop().time()
-        if now - _last_edit[0] < 3.0:
-            return
-        _last_edit[0] = now
-        try:
-            await status_msg.edit_text(
-                text, parse_mode="HTML", reply_markup=buttons,
-            )
-        except RetryAfter as e:
-            _last_edit[0] = now + e.retry_after
-        except Exception:
-            pass
+    if ASYNC_FEEDBACK:
+        result = await run_prompt_queued(project_name, prompt, None)
+    else:
+        last_status: list[str] = []
+        _last_edit: list[float] = [0.0]
 
-    async def on_status(label: str) -> None:
-        text = f"{base}\n\n{html.escape(label)}"
-        if last_status and last_status[0] == text:
-            return
-        last_status[:] = [text]
-        await _edit_status(text)
+        async def _edit_status(text: str) -> None:
+            now = asyncio.get_event_loop().time()
+            if now - _last_edit[0] < 3.0:
+                return
+            _last_edit[0] = now
+            try:
+                await status_msg.edit_text(
+                    text, parse_mode="HTML", reply_markup=buttons,
+                )
+            except RetryAfter as e:
+                _last_edit[0] = now + e.retry_after
+            except Exception:
+                pass
 
-    stop_heartbeat = asyncio.Event()
-    start_time = asyncio.get_event_loop().time()
-
-    async def heartbeat() -> None:
-        while not stop_heartbeat.is_set():
-            await asyncio.sleep(10)
-            if stop_heartbeat.is_set():
-                break
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            mins, secs = divmod(elapsed, 60)
-            elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            current = last_status[0] if last_status else "Clauding…"
-            text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
+        async def on_status(label: str) -> None:
+            text = f"{base}\n\n{html.escape(label)}"
+            if last_status and last_status[0] == text:
+                return
             last_status[:] = [text]
             await _edit_status(text)
 
-    heartbeat_task = asyncio.create_task(heartbeat())
+        stop_heartbeat = asyncio.Event()
+        start_time = asyncio.get_event_loop().time()
 
-    result = await run_prompt_queued(
-        project_name, prompt, on_status
-    )
+        async def heartbeat() -> None:
+            while not stop_heartbeat.is_set():
+                await asyncio.sleep(10)
+                if stop_heartbeat.is_set():
+                    break
+                elapsed = int(
+                    asyncio.get_event_loop().time() - start_time
+                )
+                mins, secs = divmod(elapsed, 60)
+                elapsed_str = (
+                    f"{mins}m {secs}s" if mins else f"{secs}s"
+                )
+                current = last_status[0] if last_status else "Clauding…"
+                text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
+                last_status[:] = [text]
+                await _edit_status(text)
 
-    stop_heartbeat.set()
-    heartbeat_task.cancel()
-    try:
-        await heartbeat_task
-    except asyncio.CancelledError:
-        pass
+        heartbeat_task = asyncio.create_task(heartbeat())
+
+        result = await run_prompt_queued(
+            project_name, prompt, on_status
+        )
+
+        stop_heartbeat.set()
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
     try:
         await status_msg.delete()
@@ -1209,58 +1218,66 @@ async def callback_quick_reply(
     status_msg = await cq.message.reply_text(
         f"{base}\n\nClauding…", parse_mode="HTML", reply_markup=buttons,
     )
-    last_status: list[str] = []
-    _last_edit: list[float] = [0.0]
 
-    async def _edit_status(text: str) -> None:
-        now = asyncio.get_event_loop().time()
-        if now - _last_edit[0] < 3.0:
-            return
-        _last_edit[0] = now
-        try:
-            await status_msg.edit_text(
-                text, parse_mode="HTML", reply_markup=buttons,
-            )
-        except RetryAfter as e:
-            _last_edit[0] = now + e.retry_after
-        except Exception:
-            pass
+    if ASYNC_FEEDBACK:
+        result = await run_prompt_queued(project_name, prompt, None)
+    else:
+        last_status: list[str] = []
+        _last_edit: list[float] = [0.0]
 
-    async def on_status(label: str) -> None:
-        text = f"{base}\n\n{html.escape(label)}"
-        if last_status and last_status[0] == text:
-            return
-        last_status[:] = [text]
-        await _edit_status(text)
+        async def _edit_status(text: str) -> None:
+            now = asyncio.get_event_loop().time()
+            if now - _last_edit[0] < 3.0:
+                return
+            _last_edit[0] = now
+            try:
+                await status_msg.edit_text(
+                    text, parse_mode="HTML", reply_markup=buttons,
+                )
+            except RetryAfter as e:
+                _last_edit[0] = now + e.retry_after
+            except Exception:
+                pass
 
-    stop_heartbeat = asyncio.Event()
-    start_time = asyncio.get_event_loop().time()
-
-    async def heartbeat() -> None:
-        while not stop_heartbeat.is_set():
-            await asyncio.sleep(10)
-            if stop_heartbeat.is_set():
-                break
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            mins, secs = divmod(elapsed, 60)
-            elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            current = last_status[0] if last_status else "Clauding…"
-            text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
+        async def on_status(label: str) -> None:
+            text = f"{base}\n\n{html.escape(label)}"
+            if last_status and last_status[0] == text:
+                return
             last_status[:] = [text]
             await _edit_status(text)
 
-    heartbeat_task = asyncio.create_task(heartbeat())
+        stop_heartbeat = asyncio.Event()
+        start_time = asyncio.get_event_loop().time()
 
-    result = await run_prompt_queued(
-        project_name, prompt, on_status
-    )
+        async def heartbeat() -> None:
+            while not stop_heartbeat.is_set():
+                await asyncio.sleep(10)
+                if stop_heartbeat.is_set():
+                    break
+                elapsed = int(
+                    asyncio.get_event_loop().time() - start_time
+                )
+                mins, secs = divmod(elapsed, 60)
+                elapsed_str = (
+                    f"{mins}m {secs}s" if mins else f"{secs}s"
+                )
+                current = last_status[0] if last_status else "Clauding…"
+                text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
+                last_status[:] = [text]
+                await _edit_status(text)
 
-    stop_heartbeat.set()
-    heartbeat_task.cancel()
-    try:
-        await heartbeat_task
-    except asyncio.CancelledError:
-        pass
+        heartbeat_task = asyncio.create_task(heartbeat())
+
+        result = await run_prompt_queued(
+            project_name, prompt, on_status
+        )
+
+        stop_heartbeat.set()
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
     try:
         await status_msg.delete()
