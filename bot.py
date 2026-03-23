@@ -143,13 +143,16 @@ def _build_quick_replies(
 
 _FILE_EXTENSIONS = frozenset([
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
-    ".csv", ".xlsx", ".docx", ".txt", ".zip", ".svg",
-    ".mp4", ".json", ".html",
+    ".csv", ".xlsx", ".docx", ".pptx", ".ppt",
+    ".txt", ".zip", ".svg", ".mp4", ".json", ".html",
+    ".py", ".js", ".ts", ".xml", ".yaml", ".yml",
+    ".md", ".log", ".tar", ".gz",
 ])
 _FILE_PATH_RE = re.compile(
     r"(?<!\w)((?:/tmp|/home|/root|/var|/data|/opt)"
     r"[\w./\-_ ]+\.(?:pdf|png|jpe?g|gif|webp|csv|xlsx"
-    r"|docx|txt|zip|svg|mp4|json|html))",
+    r"|docx|pptx?|txt|zip|svg|mp4|json|html"
+    r"|py|js|ts|xml|ya?ml|md|log|tar|gz))",
     re.IGNORECASE,
 )
 
