@@ -1170,15 +1170,21 @@ async def callback_quick_reply(
 
     project_name = parts[1]
     action = parts[2]
-    # Use action as prompt: "Yes, <action>"
-    prompt = f"Yes, {action.lower()}."
 
-    await cq.answer(f"Running: {prompt[:30]}")
-    # Remove buttons from original message
+    # Remove buttons immediately to prevent double-click
     try:
         await cq.edit_message_reply_markup(None)
     except Exception:
         pass
+
+    # Reject if project is already busy
+    if is_project_busy(project_name):
+        await cq.answer("Project is busy, wait for it to finish.")
+        return
+
+    # Use action as prompt: "Yes, <action>"
+    prompt = f"Yes, {action.lower()}."
+    await cq.answer(f"Running: {prompt[:30]}")
 
     _active_project[cq.from_user.id] = project_name
 

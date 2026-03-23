@@ -148,8 +148,11 @@ _PROMPT_SUFFIX = (
     "[If you have 1-3 suggested next actions for the user, "
     "end your response with a line: "
     "SUGGESTED_ACTIONS: action1 | action2 | action3 "
-    "(max 28 chars each, imperative verb phrases like "
-    "'Save to Joplin', 'Run tests', 'Deploy to prod'). "
+    "(max 28 chars each). Actions MUST be self-contained "
+    "imperative commands that make sense without context, "
+    "e.g. 'Save notes to Joplin', 'Run pytest', "
+    "'Build slide deck'. NEVER use vague labels like "
+    "'Confirm', 'Continue', 'Proceed'. "
     "Omit this line if no clear next actions.]"
 )
 
