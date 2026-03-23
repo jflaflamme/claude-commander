@@ -327,8 +327,11 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 async def on_ready():
     logger.info("Discord bot ready as %s", bot.user)
     try:
-        synced = await bot.tree.sync()
-        logger.info("Synced %d slash commands", len(synced))
+        # Sync to all guilds the bot is in for instant availability
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+        logger.info("Synced slash commands to %d guilds", len(bot.guilds))
     except Exception as e:
         logger.error("Failed to sync commands: %s", e)
 
@@ -823,7 +826,25 @@ async def on_message(message: discord.Message):
     if message.content.startswith("!") or message.content.startswith("/"):
         return
 
+    # Only respond if: bot is mentioned (user or role), or channel has a binding
+    mentioned = bot.user in message.mentions
+    # Also check role mentions — users often @mention the bot's role
+    if not mentioned and message.guild:
+        bot_member = message.guild.get_member(bot.user.id)
+        if bot_member:
+            mentioned = any(role in message.role_mentions for role in bot_member.roles if role.name != "@everyone")
+    bound_project, _ = _resolve_project(message.channel)
+    if not mentioned and not bound_project:
+        return
+
     prompt = message.content.strip()
+    # Strip bot user or role mentions from the prompt
+    if bot.user:
+        prompt = re.sub(rf"<@!?{bot.user.id}>\s*", "", prompt).strip()
+    if message.role_mentions:
+        for role in message.role_mentions:
+            prompt = re.sub(rf"<@&{role.id}>\s*", "", prompt).strip()
+
     if not prompt and not message.attachments:
         return
 
