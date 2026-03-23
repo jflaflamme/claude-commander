@@ -37,9 +37,6 @@ TG_MAX_LEN = 4096
 # Timeout for a single prompt (5 minutes)
 PROMPT_TIMEOUT = 300
 
-# Default model
-DEFAULT_MODEL = "sonnet"
-
 # Per-project persistent clients
 _clients: dict[str, ClaudeSDKClient] = {}
 
@@ -138,6 +135,48 @@ def _label_from_tool(tool: str, inp: dict) -> str:
         if len(parts) >= 3:
             return f"→ {parts[1]}: {parts[2]}"
     return f"→ {tool}"
+
+
+# Context + prompt suffix appended to every prompt
+_PROMPT_SUFFIX = (
+    "\n\n[CONTEXT: You are running inside a Telegram bot. "
+    "Your text output is sent directly to the user's Telegram chat. "
+    "Any file paths you output (e.g. /tmp/report.pdf, /home/*/file.png) "
+    "are automatically detected and sent as Telegram attachments. "
+    "To send a file to the user, just create/save it and mention "
+    "its full path in your response — no extra steps needed.]\n"
+    "[If you have 1-3 suggested next actions for the user, "
+    "end your response with a line: "
+    "SUGGESTED_ACTIONS: action1 | action2 | action3 "
+    "(max 28 chars each, imperative verb phrases like "
+    "'Save to Joplin', 'Run tests', 'Deploy to prod'). "
+    "Omit this line if no clear next actions.]"
+)
+
+# Regex to extract and strip suggested actions from result text
+_ACTION_RE = re.compile(
+    r"\n?SUGGESTED_ACTIONS:\s*(.+)$",
+    re.MULTILINE,
+)
+
+
+def _parse_suggested_actions(text: str) -> tuple[str, list[str]]:
+    """Extract suggested actions from result text.
+
+    Returns (cleaned_text, actions_list).
+    """
+    match = _ACTION_RE.search(text)
+    if not match:
+        return text, []
+
+    raw = match.group(1).strip()
+    actions = [
+        a.strip()[:28] for a in raw.split("|")
+        if a.strip()
+    ][:3]  # Max 3
+
+    cleaned = text[:match.start()].rstrip()
+    return cleaned, actions
 
 
 def set_telegram_bot(bot, chat_id: int) -> None:
@@ -365,7 +404,6 @@ def _build_options(
         cwd=cwd,
         permission_mode="acceptEdits",
         setting_sources=["user", "project"],
-        model=DEFAULT_MODEL,
         include_partial_messages=True,
     )
     # USE_SUBSCRIPTION=true forces OAuth even when ANTHROPIC_API_KEY is set
@@ -434,17 +472,21 @@ async def reset_client(project_name: str) -> None:
 
 
 async def warmup_projects() -> None:
-    """Pre-connect clients for all registered projects."""
+    """Pre-connect clients for all registered projects (parallel)."""
     projects = db.list_projects()
-    for p in projects:
-        name = p["name"]
-        cwd = p["cwd"]
+    if not projects:
+        return
+
+    async def _warm(name: str, cwd: str) -> None:
         try:
             await _get_client(name, cwd)
+            logger.info("[%s] Warmed up", name)
         except Exception as e:
-            logger.warning(
-                "[%s] Warmup failed: %s", name, e
-            )
+            logger.warning("[%s] Warmup failed: %s", name, e)
+
+    await asyncio.gather(
+        *(_warm(p["name"], p["cwd"]) for p in projects)
+    )
 
 
 async def _handle_message(
@@ -489,11 +531,17 @@ async def run_prompt(
     project_name: str,
     prompt: str,
     on_status: Callable[[str], Any] | None = None,
-) -> str:
-    """Send a prompt to a persistent client."""
+) -> dict[str, Any]:
+    """Send a prompt to a persistent client.
+
+    Returns dict with 'text' (str result) and 'actions' (list of suggested actions).
+    """
     project = db.get_project(project_name)
     if not project:
-        return f"Project '{project_name}' not found."
+        return {
+            "text": f"Project '{project_name}' not found.",
+            "actions": [],
+        }
 
     cwd = project["cwd"]
 
@@ -503,7 +551,10 @@ async def run_prompt(
         logger.exception(
             "[%s] Failed to connect", project_name
         )
-        return f"Connection error: {e}"
+        return {
+            "text": f"Connection error: {e}",
+            "actions": [],
+        }
 
     preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
     logger.info("[%s] Prompt: %s", project_name, preview)
@@ -512,6 +563,9 @@ async def run_prompt(
     if interp:
         logger.debug("[%s] Interpretation: %s", project_name, interp)
         prompt = f"{interp}\n{prompt}"
+
+    # Add Telegram context + suggested actions instruction
+    prompt += _PROMPT_SUFFIX
 
     async def _emit(label: str) -> None:
         if on_status:
@@ -536,11 +590,17 @@ async def run_prompt(
                 )
 
         db.touch_session(project_name)
-        return result_text
+        cleaned, actions = _parse_suggested_actions(result_text)
+        if actions:
+            logger.info(
+                "[%s] Suggested actions: %s",
+                project_name, actions,
+            )
+        return {"text": cleaned, "actions": actions}
 
     except asyncio.CancelledError:
         logger.info("[%s] Cancelled", project_name)
-        return "Cancelled."
+        return {"text": "Cancelled.", "actions": []}
     except Exception as e:
         logger.warning(
             "[%s] Error: %s — reconnecting", project_name, e
@@ -559,12 +619,18 @@ async def run_prompt(
                         message.result or "(no output)"
                     )
             db.touch_session(project_name)
-            return result_text
+            cleaned, actions = _parse_suggested_actions(
+                result_text
+            )
+            return {"text": cleaned, "actions": actions}
         except Exception as retry_err:
             logger.exception(
                 "[%s] Retry failed", project_name
             )
-            return f"Error: {retry_err}"
+            return {
+                "text": f"Error: {retry_err}",
+                "actions": [],
+            }
 
 
 # Per-project prompt queues
@@ -616,7 +682,7 @@ async def _queue_worker(
             except asyncio.CancelledError:
                 logger.info("[%s] Task was cancelled", project_name)
                 if not future.done():
-                    future.set_result("Cancelled.")
+                    future.set_result({"text": "Cancelled.", "actions": []})
             except Exception as e:
                 if not future.done():
                     future.set_exception(e)

@@ -79,9 +79,10 @@ def _get_active_project(user_id: int) -> str | None:
 
 
 async def _send_result(
-    update: Update, result: str, project_name: str = ""
+    update: Update, result: str, project_name: str = "",
+    suggested_actions: list[str] | None = None,
 ) -> None:
-    """Send result with optional quick-reply buttons."""
+    """Send result with optional quick-reply buttons from suggested actions."""
     formatted = format_html(result)
     chunks = split_message(formatted)
 
@@ -97,7 +98,9 @@ async def _send_result(
 
     # Last chunk gets quick-reply buttons
     last = chunks[-1] if chunks else "(no output)"
-    buttons = _build_quick_replies(result, project_name)
+    buttons = _build_quick_replies(
+        suggested_actions, project_name
+    )
 
     try:
         await update.message.reply_text(
@@ -115,43 +118,19 @@ async def _send_result(
 
 
 def _build_quick_replies(
-    result: str, project_name: str
+    suggested_actions: list[str] | None, project_name: str
 ) -> InlineKeyboardMarkup | None:
-    """Build contextual quick-reply buttons."""
-    if not project_name:
+    """Build quick-reply buttons from suggested actions."""
+    if not project_name or not suggested_actions:
         return None
 
-    buttons = []
-    result_lower = result.lower()
-
-    if re.search(
-        r"\b(error|failed|traceback|exception)\b", result_lower
-    ):
-        buttons.append(
-            InlineKeyboardButton(
-                "Fix it",
-                callback_data=f"qr:{project_name}:fix",
-            )
+    buttons = [
+        InlineKeyboardButton(
+            action,
+            callback_data=f"qr:{project_name}:{action}",
         )
-    if re.search(
-        r"\b(created|wrote|edited|modified)\b", result_lower
-    ):
-        buttons.append(
-            InlineKeyboardButton(
-                "Show diff",
-                callback_data=f"qr:{project_name}:diff",
-            )
-        )
-    if re.search(
-        r"\b(run(ning)? tests?|test suite|failing test|pytest|unittest)\b",
-        result_lower,
-    ):
-        buttons.append(
-            InlineKeyboardButton(
-                "Run tests",
-                callback_data=f"qr:{project_name}:test",
-            )
-        )
+        for action in suggested_actions[:3]  # Max 3 buttons
+    ]
 
     if not buttons:
         return None
@@ -200,12 +179,6 @@ async def _send_files_from_result(
             logger.warning("Failed to send file %s: %s", path, e)
 
 
-# Quick-reply prompt mappings
-QR_PROMPTS = {
-    "fix": "Fix the error mentioned in the previous response.",
-    "diff": "Show git diff of recent changes.",
-    "test": "Run the tests.",
-}
 
 # --- Command registry ---
 
@@ -806,7 +779,7 @@ async def _run_and_reply(
     )
 
     if ASYNC_FEEDBACK:
-        result = await run_prompt_queued(project_name, prompt, None)
+        result_dict = await run_prompt_queued(project_name, prompt, None)
     else:
         last_status: list[str] = []
         _last_edit: list[float] = [0.0]
@@ -854,7 +827,7 @@ async def _run_and_reply(
 
         heartbeat_task = asyncio.create_task(heartbeat())
 
-        result = await run_prompt_queued(
+        result_dict = await run_prompt_queued(
             project_name, prompt, on_status
         )
 
@@ -870,11 +843,16 @@ async def _run_and_reply(
     except Exception:
         pass
 
-    if result == "Cancelled.":
+    result_text = result_dict.get("text", "")
+    suggested_actions = result_dict.get("actions", [])
+
+    if result_text == "Cancelled.":
         return
 
-    await _send_result(update, result, project_name)
-    await _send_files_from_result(update, result)
+    await _send_result(
+        update, result_text, project_name, suggested_actions
+    )
+    await _send_files_from_result(update, result_text)
 
 
 # Need uuid for cancel IDs
@@ -1189,7 +1167,8 @@ async def callback_quick_reply(
 
     project_name = parts[1]
     action = parts[2]
-    prompt = QR_PROMPTS.get(action, action)
+    # Use action as prompt: "Yes, <action>"
+    prompt = f"Yes, {action.lower()}."
 
     await cq.answer(f"Running: {prompt[:30]}")
     # Remove buttons from original message
@@ -1220,7 +1199,7 @@ async def callback_quick_reply(
     )
 
     if ASYNC_FEEDBACK:
-        result = await run_prompt_queued(project_name, prompt, None)
+        result_dict = await run_prompt_queued(project_name, prompt, None)
     else:
         last_status: list[str] = []
         _last_edit: list[float] = [0.0]
@@ -1268,7 +1247,7 @@ async def callback_quick_reply(
 
         heartbeat_task = asyncio.create_task(heartbeat())
 
-        result = await run_prompt_queued(
+        result_dict = await run_prompt_queued(
             project_name, prompt, on_status
         )
 
@@ -1284,10 +1263,13 @@ async def callback_quick_reply(
     except Exception:
         pass
 
-    formatted = format_html(result)
+    result_text = result_dict.get("text", "")
+    suggested_actions = result_dict.get("actions", [])
+
+    formatted = format_html(result_text)
     chunks = split_message(formatted)
     qr_buttons = _build_quick_replies(
-        result, project_name
+        suggested_actions, project_name
     )
 
     for chunk in chunks[:-1]:
@@ -1313,7 +1295,7 @@ async def callback_quick_reply(
         )
 
     # Send any files Claude created
-    await _send_files_from_result(cq.message, result)
+    await _send_files_from_result(cq.message, result_text)
 
 
 # --- Text handler with auto-routing ---

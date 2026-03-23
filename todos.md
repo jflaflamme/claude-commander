@@ -1,7 +1,7 @@
 # Project Todos
 
 ## Active
-- [ ] Thinking mode: add per-project thinking config (ThinkingConfigEnabled/Disabled/Adaptive) via /model or project setting — improves complex task reasoning, costs more tokens
+- [x] Model selection: removed hardcoded DEFAULT_MODEL, SDK now uses user's Claude Code settings | Done: 03/23/2026
 - [ ] Permission timeout option: per-project setting to auto-approve or auto-deny after N seconds if user doesn't respond
 
 ## Completed
