@@ -163,6 +163,12 @@ def resolve_permission(request_id: str, allowed: bool) -> bool:
     return False
 
 
+def is_project_busy(project_name: str) -> bool:
+    """Return True if a prompt is currently running for this project."""
+    task = _running_tasks.get(project_name)
+    return task is not None and not task.done()
+
+
 async def cancel_running(project_name: str) -> bool:
     task = _running_tasks.get(project_name)
     logger.info(
@@ -173,11 +179,32 @@ async def cancel_running(project_name: str) -> bool:
         list(_running_tasks.keys()),
     )
     task = _running_tasks.pop(project_name, None)
+
+    # Drain any queued prompts
+    q = _queues.get(project_name)
+    drained = 0
+    if q:
+        while True:
+            try:
+                _, future, _ = q.get_nowait()
+                if not future.done():
+                    future.set_result("Cancelled.")
+                q.task_done()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+    if drained:
+        logger.info(
+            "[%s] Drained %d queued prompt(s)", project_name, drained
+        )
+
     if task and not task.done():
         logger.info("[%s] Cancelling task and disconnecting client", project_name)
         task.cancel()
         await reset_client(project_name)
         logger.info("[%s] Cancel complete", project_name)
+        return True
+    if drained:
         return True
     logger.warning("[%s] cancel_running: nothing to cancel", project_name)
     return False

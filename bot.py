@@ -12,9 +12,6 @@ import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-
-load_dotenv()
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
@@ -32,6 +29,7 @@ from claude_runner import (
     disconnect_client,
     format_html,
     get_mcp_servers_for_project,
+    is_project_busy,
     reset_memory,
     match_project_by_description,
     resolve_permission,
@@ -43,6 +41,8 @@ from claude_runner import (
     strip_markdown,
     _clients,
 )
+
+load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1419,6 +1419,17 @@ async def handle_text(
             else:
                 # 4. Just pick first project
                 project_name = projects[0]["name"]
+
+    # Stick to this project for subsequent messages
+    _active_project[user_id] = project_name
+
+    # Notify if queuing behind a running task
+    if is_project_busy(project_name):
+        await update.message.reply_text(
+            f"⏳ <b>{html.escape(project_name)}</b> is busy "
+            "— your message is queued. Press Cancel to abort.",
+            parse_mode="HTML",
+        )
 
     await _run_and_reply(update, project_name, prompt)
 
