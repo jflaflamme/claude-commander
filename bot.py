@@ -55,6 +55,9 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ASYNC_FEEDBACK = os.getenv("ASYNC_FEEDBACK", "").lower() in ("1", "true", "yes")
+DROP_PENDING = os.getenv(
+    "DROP_PENDING_UPDATES", "true"
+).lower() not in ("0", "false", "no")
 
 try:
     from groq import AsyncGroq as _AsyncGroq
@@ -1616,20 +1619,31 @@ _PID_FILE = Path(__file__).parent / "data" / "bot.pid"
 
 
 def _acquire_pid() -> None:
-    """Exit if another instance is already running."""
+    """Stop old instance if running, then write our PID."""
+    import signal
+
     _PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     if _PID_FILE.exists():
-        pid = int(_PID_FILE.read_text().strip())
         try:
-            os.kill(pid, 0)  # 0 = check existence only
-            logger.error(
-                "Another instance is running (PID %d). "
-                "Stop it first or delete %s",
-                pid, _PID_FILE,
-            )
-            sys.exit(1)
-        except (ProcessLookupError, PermissionError):
-            pass  # stale PID file — proceed
+            pid = int(_PID_FILE.read_text().strip())
+        except ValueError:
+            pid = 0
+        if pid and pid != os.getpid():
+            try:
+                os.kill(pid, 0)  # check existence
+                logger.info(
+                    "Stopping old instance (PID %d)...", pid
+                )
+                os.kill(pid, signal.SIGTERM)
+                # Give it a moment to shut down
+                import time
+                time.sleep(2)
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass  # already dead
+            except (ProcessLookupError, PermissionError):
+                pass  # stale PID file
     _PID_FILE.write_text(str(os.getpid()))
 
 
@@ -1730,6 +1744,16 @@ def main() -> None:
 
     set_telegram_bot(app.bot, ADMIN_CHAT_ID)
 
+    async def error_handler(update, context):
+        """Log errors and suppress Conflict noise."""
+        err = context.error
+        if "Conflict" in str(err):
+            logger.warning("Telegram Conflict — another instance? %s", err)
+            return
+        logger.error("Unhandled exception: %s", err, exc_info=err)
+
+    app.add_error_handler(error_handler)
+
     async def post_init(application):
         logger.info("Warming up projects in background...")
         asyncio.create_task(warmup_projects())
@@ -1745,7 +1769,10 @@ def main() -> None:
     app.post_shutdown = post_shutdown
 
     logger.info("Claude Commander starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=DROP_PENDING,
+    )
 
 
 if __name__ == "__main__":

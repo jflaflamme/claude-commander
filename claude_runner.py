@@ -137,15 +137,15 @@ def _label_from_tool(tool: str, inp: dict) -> str:
     return f"→ {tool}"
 
 
-# Context + prompt suffix appended to every prompt
-_PROMPT_SUFFIX = (
-    "\n\n[CONTEXT: You are running inside a Telegram bot. "
+# System prompt append — injected via ClaudeAgentOptions, not per-prompt
+_SYSTEM_APPEND = (
+    "\n\nYou are running inside a Telegram bot. "
     "Your text output is sent directly to the user's Telegram chat. "
     "Any file paths you output (e.g. /tmp/report.pdf, /home/*/file.png) "
     "are automatically detected and sent as Telegram attachments. "
     "To send a file to the user, just create/save it and mention "
-    "its full path in your response — no extra steps needed.]\n"
-    "[If you have 1-3 suggested next actions for the user, "
+    "its full path in your response — no extra steps needed.\n\n"
+    "If you have 1-3 suggested next actions for the user, "
     "end your response with a line: "
     "SUGGESTED_ACTIONS: action1 | action2 | action3 "
     "(max 28 chars each). Actions MUST be self-contained "
@@ -153,7 +153,7 @@ _PROMPT_SUFFIX = (
     "e.g. 'Save notes to Joplin', 'Run pytest', "
     "'Build slide deck'. NEVER use vague labels like "
     "'Confirm', 'Continue', 'Proceed'. "
-    "Omit this line if no clear next actions.]"
+    "Omit this line if no clear next actions."
 )
 
 # Regex to extract and strip suggested actions from result text
@@ -231,7 +231,7 @@ async def cancel_running(project_name: str) -> bool:
             try:
                 _, future, _ = q.get_nowait()
                 if not future.done():
-                    future.set_result("Cancelled.")
+                    future.set_result({"text": "Cancelled.", "actions": []})
                 q.task_done()
                 drained += 1
             except asyncio.QueueEmpty:
@@ -408,6 +408,11 @@ def _build_options(
         permission_mode="acceptEdits",
         setting_sources=["user", "project"],
         include_partial_messages=True,
+        system_prompt={
+            "type": "preset",
+            "preset": "claude_code",
+            "append": _SYSTEM_APPEND,
+        },
     )
     # USE_SUBSCRIPTION=true forces OAuth even when ANTHROPIC_API_KEY is set
     # in the environment (e.g. needed by other tools in the same process).
@@ -566,9 +571,6 @@ async def run_prompt(
     if interp:
         logger.debug("[%s] Interpretation: %s", project_name, interp)
         prompt = f"{interp}\n{prompt}"
-
-    # Add Telegram context + suggested actions instruction
-    prompt += _PROMPT_SUFFIX
 
     async def _emit(label: str) -> None:
         if on_status:
