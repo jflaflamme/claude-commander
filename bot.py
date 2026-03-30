@@ -24,11 +24,19 @@ from telegram.ext import (
 )
 
 import db
+import time
+
 from claude_runner import (
+    IDLE_DISCONNECT,
+    INACTIVITY_TIMEOUT,
+    PROMPT_TIMEOUT,
     cancel_running,
     disconnect_client,
     format_html,
+    get_last_activity,
     get_mcp_servers_for_project,
+    idle_reaper,
+    is_awaiting_permission,
     is_project_busy,
     reset_memory,
     match_project_by_description,
@@ -36,10 +44,10 @@ from claude_runner import (
     run_prompt_queued,
     scan_projects,
     set_telegram_bot,
-    warmup_projects,
     split_message,
     strip_markdown,
     _clients,
+    _running_tasks,
 )
 
 load_dotenv()
@@ -59,6 +67,9 @@ DROP_PENDING = os.getenv(
     "DROP_PENDING_UPDATES", "true"
 ).lower() not in ("0", "false", "no")
 
+# Heartbeat toggle (on by default, controllable via /heartbeat)
+_heartbeat_enabled: bool = True
+
 try:
     from groq import AsyncGroq as _AsyncGroq
     _groq_client = _AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -67,15 +78,24 @@ except ImportError:
 
 _active_project: dict[int, str] = {}
 
+# Last prompt per project — for retry after timeout
+_last_prompt: dict[str, str] = {}
+
 
 def is_admin(update: Update) -> bool:
-    return update.effective_user.id == ADMIN_CHAT_ID
+    # Reject edited messages (update.message is None)
+    if not update.message:
+        return False
+    return (
+        update.effective_user is not None
+        and update.effective_user.id == ADMIN_CHAT_ID
+    )
 
 
 def _get_active_project(user_id: int) -> str | None:
     if user_id in _active_project:
         name = _active_project[user_id]
-        if db.get_project(name):
+        if name == COMMANDER_PROJECT or db.get_project(name):
             return name
         del _active_project[user_id]
     return None
@@ -354,6 +374,15 @@ async def cmd_scan(
             )
         ])
 
+    # "Add all" button when multiple projects found
+    if len(new) > 1:
+        buttons.append([
+            InlineKeyboardButton(
+                f"Add all {len(new)} projects",
+                callback_data="scan:__all__",
+            )
+        ])
+
     # Store scan results for callback
     context.bot_data["scan_results"] = {
         p["name"]: p for p in new
@@ -438,6 +467,11 @@ async def cmd_switch(
             )
             for p in projects
         ]
+        # Add commander meta-project
+        buttons.append(InlineKeyboardButton(
+            "commander",
+            callback_data=f"switch:{COMMANDER_PROJECT}",
+        ))
         await update.message.reply_text(
             f"Current: {current}\nTap to switch:",
             reply_markup=InlineKeyboardMarkup([buttons]),
@@ -445,6 +479,12 @@ async def cmd_switch(
         return
 
     name = context.args[0]
+    if name in (COMMANDER_PROJECT, "bot", "self"):
+        _active_project[update.effective_user.id] = COMMANDER_PROJECT
+        await update.message.reply_text(
+            "Switched to commander mode."
+        )
+        return
     if not db.get_project(name):
         await update.message.reply_text(
             f"Unknown project: {name}"
@@ -754,13 +794,159 @@ async def cmd_feedback(
     await update.message.reply_text(f"Feedback #{fid} saved.")
 
 
+@cmd("heartbeat", "on|off — toggle inactivity watchdog")
+async def cmd_heartbeat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not is_admin(update):
+        return
+    global _heartbeat_enabled
+    args = context.args
+    if not args:
+        state = "on" if _heartbeat_enabled else "off"
+        active = len(_clients)
+        await update.message.reply_text(
+            f"Heartbeat is <b>{state}</b>\n"
+            f"Inactivity warn: {INACTIVITY_TIMEOUT}s\n"
+            f"Hard timeout: {PROMPT_TIMEOUT}s\n"
+            f"Idle disconnect: {IDLE_DISCONNECT}s\n"
+            f"Active clients: {active}",
+            parse_mode="HTML",
+        )
+        return
+    val = args[0].lower()
+    if val in ("on", "1", "true", "yes"):
+        _heartbeat_enabled = True
+        await update.message.reply_text("Heartbeat enabled.")
+    elif val in ("off", "0", "false", "no"):
+        _heartbeat_enabled = False
+        await update.message.reply_text(
+            "Heartbeat disabled (no inactivity/timeout checks)."
+        )
+    else:
+        await update.message.reply_text("Usage: /heartbeat on|off")
+
+
 # --- Shared prompt runner with cancel button ---
+
+
+def _make_heartbeat(
+    project_name: str,
+    status_msg,
+    buttons,
+    last_status: list[str],
+    _last_edit: list[float],
+    stop_event: asyncio.Event,
+    start_time: float,
+):
+    """Create a heartbeat coroutine with inactivity and timeout detection."""
+
+    async def _edit(text: str) -> None:
+        now = asyncio.get_event_loop().time()
+        if now - _last_edit[0] < 3.0:
+            return
+        _last_edit[0] = now
+        try:
+            await status_msg.edit_text(
+                text, parse_mode="HTML", reply_markup=buttons,
+            )
+        except RetryAfter as e:
+            _last_edit[0] = now + e.retry_after
+        except Exception:
+            pass
+
+    async def heartbeat() -> None:
+        inactivity_warned = False
+        while not stop_event.is_set():
+            await asyncio.sleep(10)
+            if stop_event.is_set():
+                break
+            now = asyncio.get_event_loop().time()
+            elapsed = int(now - start_time)
+            mins, secs = divmod(elapsed, 60)
+            elapsed_str = (
+                f"{mins}m {secs}s" if mins else f"{secs}s"
+            )
+
+            # Skip inactivity/timeout while waiting for permission
+            perm_pending = is_awaiting_permission(project_name)
+
+            suffix = ""
+            if perm_pending:
+                suffix = "\n🔐 <i>Waiting for permission…</i>"
+            elif _heartbeat_enabled:
+                # Check inactivity (no SDK messages)
+                last_act = get_last_activity(project_name)
+                idle_secs = (
+                    int(time.monotonic() - last_act)
+                    if last_act else elapsed
+                )
+
+                if (
+                    idle_secs >= INACTIVITY_TIMEOUT
+                    and not inactivity_warned
+                ):
+                    inactivity_warned = True
+                    idle_m, idle_s = divmod(idle_secs, 60)
+                    suffix = (
+                        f"\n⚠️ <b>No activity for "
+                        f"{idle_m}m {idle_s}s</b>"
+                        f" — task may be stuck"
+                    )
+                    logger.warning(
+                        "[%s] Inactivity: %ds without SDK msgs",
+                        project_name, idle_secs,
+                    )
+
+            # Hard timeout — auto-kill (skip if permission pending)
+            if (
+                _heartbeat_enabled
+                and not perm_pending
+                and elapsed >= PROMPT_TIMEOUT
+            ):
+                logger.warning(
+                    "[%s] Hard timeout after %ds — killing",
+                    project_name, elapsed,
+                )
+                await cancel_running(project_name)
+                kill_msg = (
+                    f"⏰ <b>{html.escape(project_name)}</b> "
+                    f"killed after {mins}m {secs}s "
+                    f"(timeout: {PROMPT_TIMEOUT}s)"
+                )
+                retry_buttons = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "Retry",
+                        callback_data=f"retry:{project_name}",
+                    ),
+                ]])
+                try:
+                    await status_msg.edit_text(
+                        kill_msg, parse_mode="HTML",
+                        reply_markup=retry_buttons,
+                    )
+                except Exception:
+                    pass
+                return
+
+            current = (
+                last_status[0] if last_status else "Clauding…"
+            )
+            text = (
+                f"{current}\n<i>({elapsed_str} elapsed)</i>"
+                f"{suffix}"
+            )
+            last_status[:] = [text]
+            await _edit(text)
+
+    return heartbeat
 
 
 async def _run_and_reply(
     update: Update, project_name: str, prompt: str
 ) -> None:
     """Send status with Cancel button, run prompt, reply."""
+    _last_prompt[project_name] = prompt
     cancel_id = uuid.uuid4().hex[:8]
     preview = html.escape(
         prompt[:60] + ("…" if len(prompt) > 60 else "")
@@ -790,7 +976,11 @@ async def _run_and_reply(
         last_status: list[str] = []
         _last_edit: list[float] = [0.0]
 
-        async def _edit_status(text: str) -> None:
+        async def on_status(label: str) -> None:
+            text = f"{base}\n\n{html.escape(label)}"
+            if last_status and last_status[0] == text:
+                return
+            last_status[:] = [text]
             now = asyncio.get_event_loop().time()
             if now - _last_edit[0] < 3.0:
                 return
@@ -804,34 +994,13 @@ async def _run_and_reply(
             except Exception:
                 pass
 
-        async def on_status(label: str) -> None:
-            text = f"{base}\n\n{html.escape(label)}"
-            if last_status and last_status[0] == text:
-                return
-            last_status[:] = [text]
-            await _edit_status(text)
-
         stop_heartbeat = asyncio.Event()
         start_time = asyncio.get_event_loop().time()
-
-        async def heartbeat() -> None:
-            while not stop_heartbeat.is_set():
-                await asyncio.sleep(10)
-                if stop_heartbeat.is_set():
-                    break
-                elapsed = int(
-                    asyncio.get_event_loop().time() - start_time
-                )
-                mins, secs = divmod(elapsed, 60)
-                elapsed_str = (
-                    f"{mins}m {secs}s" if mins else f"{secs}s"
-                )
-                current = last_status[0] if last_status else "Clauding…"
-                text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
-                last_status[:] = [text]
-                await _edit_status(text)
-
-        heartbeat_task = asyncio.create_task(heartbeat())
+        hb = _make_heartbeat(
+            project_name, status_msg, buttons,
+            last_status, _last_edit, stop_heartbeat, start_time,
+        )
+        heartbeat_task = asyncio.create_task(hb())
 
         result_dict = await run_prompt_queued(
             project_name, prompt, on_status
@@ -874,6 +1043,12 @@ async def callback_switch(
     cq = update.callback_query
     await cq.answer()
     name = cq.data.removeprefix("switch:")
+    if name == COMMANDER_PROJECT:
+        _active_project[cq.from_user.id] = COMMANDER_PROJECT
+        await cq.edit_message_text(
+            "Switched to commander mode."
+        )
+        return
     if not db.get_project(name):
         await cq.edit_message_text(
             f"Project '{name}' no longer exists."
@@ -979,18 +1154,157 @@ async def callback_cancel(
     logger.info("Cancel button pressed for project: %s", project_name)
     if await cancel_running(project_name):
         await cq.answer("Cancelled")
+        retry_buttons = None
+        if _last_prompt.get(project_name):
+            retry_buttons = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "Retry",
+                    callback_data=f"retry:{project_name}",
+                ),
+            ]])
         try:
-            await cq.edit_message_text(f"Cancelled {project_name}.")
+            await cq.edit_message_text(
+                f"Cancelled {project_name}.",
+                reply_markup=retry_buttons,
+            )
         except BadRequest:
             pass  # message already deleted — nothing to update
     else:
         await cq.answer("Nothing to cancel")
 
 
+async def callback_retry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Retry the last prompt for a project after timeout/cancel."""
+    cq = update.callback_query
+    if cq.from_user.id != ADMIN_CHAT_ID:
+        await cq.answer("Unauthorized")
+        return
+
+    project_name = cq.data.removeprefix("retry:")
+    prompt = _last_prompt.get(project_name)
+    if not prompt:
+        await cq.answer("No prompt to retry")
+        return
+
+    if is_project_busy(project_name):
+        await cq.answer("Project is busy")
+        return
+
+    await cq.answer(f"Retrying on {project_name}")
+    try:
+        await cq.edit_message_reply_markup(None)
+    except Exception:
+        pass
+
+    _active_project[cq.from_user.id] = project_name
+
+    # Run prompt using same pattern as callback_quick_reply
+    cancel_id = uuid.uuid4().hex[:8]
+    preview = html.escape(
+        prompt[:60] + ("…" if len(prompt) > 60 else "")
+    )
+    base = f"🔄 <b>{html.escape(project_name)}</b> · {preview}"
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Cancel",
+            callback_data=f"cancel:{project_name}:{cancel_id}",
+        ),
+    ]])
+    status_msg = await cq.message.reply_text(
+        f"{base}\n\nClauding…",
+        parse_mode="HTML", reply_markup=buttons,
+    )
+
+    if ASYNC_FEEDBACK:
+        result_dict = await run_prompt_queued(
+            project_name, prompt, None
+        )
+    else:
+        last_status: list[str] = []
+        _last_edit_t: list[float] = [0.0]
+
+        async def on_status(label: str) -> None:
+            text = f"{base}\n\n{html.escape(label)}"
+            if last_status and last_status[0] == text:
+                return
+            last_status[:] = [text]
+            now = asyncio.get_event_loop().time()
+            if now - _last_edit_t[0] < 3.0:
+                return
+            _last_edit_t[0] = now
+            try:
+                await status_msg.edit_text(
+                    text, parse_mode="HTML",
+                    reply_markup=buttons,
+                )
+            except RetryAfter as e:
+                _last_edit_t[0] = now + e.retry_after
+            except Exception:
+                pass
+
+        stop_heartbeat = asyncio.Event()
+        start_time = asyncio.get_event_loop().time()
+        hb = _make_heartbeat(
+            project_name, status_msg, buttons,
+            last_status, _last_edit_t,
+            stop_heartbeat, start_time,
+        )
+        heartbeat_task = asyncio.create_task(hb())
+
+        result_dict = await run_prompt_queued(
+            project_name, prompt, on_status
+        )
+
+        stop_heartbeat.set()
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    result_text = result_dict.get("text", "")
+    suggested_actions = result_dict.get("actions", [])
+
+    formatted = format_html(result_text)
+    chunks = split_message(formatted)
+    qr_buttons = _build_quick_replies(
+        suggested_actions, project_name
+    )
+
+    for chunk in chunks[:-1]:
+        try:
+            await cq.message.reply_text(
+                chunk, parse_mode="HTML"
+            )
+        except Exception:
+            await cq.message.reply_text(
+                strip_markdown(chunk)
+            )
+
+    last = chunks[-1] if chunks else "(no output)"
+    try:
+        await cq.message.reply_text(
+            last, parse_mode="HTML",
+            reply_markup=qr_buttons,
+        )
+    except Exception:
+        await cq.message.reply_text(
+            strip_markdown(last),
+            reply_markup=qr_buttons,
+        )
+
+
 async def callback_scan(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle scan result button press."""
+    """Handle scan result button press (single or bulk add)."""
     cq = update.callback_query
     if cq.from_user.id != ADMIN_CHAT_ID:
         await cq.answer("Unauthorized")
@@ -998,15 +1312,37 @@ async def callback_scan(
 
     name = cq.data.removeprefix("scan:")
     results = context.bot_data.get("scan_results", {})
-    project = results.get(name)
 
-    if not project:
+    if not results:
         await cq.answer("Scan expired, run /scan again")
+        return
+
+    # Bulk add all
+    if name == "__all__":
+        added = []
+        for pname, project in results.items():
+            db.add_project(
+                pname, project["path"], project["description"]
+            )
+            added.append(pname)
+        context.bot_data["scan_results"] = {}
+        await cq.answer(f"Added {len(added)} projects")
+        await cq.edit_message_text(
+            f"Added {len(added)} projects:\n"
+            + "\n".join(f"• {n}" for n in added)
+        )
+        return
+
+    # Single add
+    project = results.get(name)
+    if not project:
+        await cq.answer("Already added or expired")
         return
 
     db.add_project(
         name, project["path"], project["description"]
     )
+    results.pop(name, None)
     await cq.answer(f"Added: {name}")
     await cq.edit_message_text(
         f"Added '{name}' at {project['path']}"
@@ -1216,7 +1552,11 @@ async def callback_quick_reply(
         last_status: list[str] = []
         _last_edit: list[float] = [0.0]
 
-        async def _edit_status(text: str) -> None:
+        async def on_status(label: str) -> None:
+            text = f"{base}\n\n{html.escape(label)}"
+            if last_status and last_status[0] == text:
+                return
+            last_status[:] = [text]
             now = asyncio.get_event_loop().time()
             if now - _last_edit[0] < 3.0:
                 return
@@ -1230,34 +1570,13 @@ async def callback_quick_reply(
             except Exception:
                 pass
 
-        async def on_status(label: str) -> None:
-            text = f"{base}\n\n{html.escape(label)}"
-            if last_status and last_status[0] == text:
-                return
-            last_status[:] = [text]
-            await _edit_status(text)
-
         stop_heartbeat = asyncio.Event()
         start_time = asyncio.get_event_loop().time()
-
-        async def heartbeat() -> None:
-            while not stop_heartbeat.is_set():
-                await asyncio.sleep(10)
-                if stop_heartbeat.is_set():
-                    break
-                elapsed = int(
-                    asyncio.get_event_loop().time() - start_time
-                )
-                mins, secs = divmod(elapsed, 60)
-                elapsed_str = (
-                    f"{mins}m {secs}s" if mins else f"{secs}s"
-                )
-                current = last_status[0] if last_status else "Clauding…"
-                text = f"{current}\n<i>({elapsed_str} elapsed)</i>"
-                last_status[:] = [text]
-                await _edit_status(text)
-
-        heartbeat_task = asyncio.create_task(heartbeat())
+        hb = _make_heartbeat(
+            project_name, status_msg, buttons,
+            last_status, _last_edit, stop_heartbeat, start_time,
+        )
+        heartbeat_task = asyncio.create_task(hb())
 
         result_dict = await run_prompt_queued(
             project_name, prompt, on_status
@@ -1308,6 +1627,201 @@ async def callback_quick_reply(
 
     # Send any files Claude created
     await _send_files_from_result(cq.message, result_text)
+
+
+# --- Commander meta-project (bot self-management) ---
+
+COMMANDER_PROJECT = "commander"
+
+_CMD_INTENTS = [
+    (r"\b(?:list|show|all)\s*projects?\b", "list_projects"),
+    (r"\bscan\b", "scan"),
+    (r"\badd\s+(?:all|everything)\b", "add_all"),
+    (r"\badd\s+(\S+)", "add_one"),
+    (r"\bremove\s+(\S+)", "remove"),
+    (r"\bstatus\b", "status"),
+    (r"\breset\s+(\S+)", "reset"),
+    (r"\bheartbeat\s*(on|off)?\b", "heartbeat"),
+    (r"\bpermissions?\b", "permissions"),
+    (r"\bhelp\b", "help"),
+]
+
+
+async def _handle_commander(
+    update: Update, prompt: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle text when switched to the commander meta-project."""
+    global _heartbeat_enabled
+    text = prompt.strip().lower()
+
+    for pattern, intent in _CMD_INTENTS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            break
+    else:
+        intent = None
+        m = None
+
+    if intent == "list_projects":
+        projects = db.list_projects()
+        if not projects:
+            await update.message.reply_text("No projects registered.")
+            return
+        lines = []
+        for p in projects:
+            name = p["name"]
+            active = " (active)" if name in _clients else ""
+            lines.append(f"• <b>{html.escape(name)}</b>{active}")
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="HTML"
+        )
+
+    elif intent == "scan":
+        found = scan_projects()
+        existing = {p["cwd"] for p in db.list_projects()}
+        new = [p for p in found if p["path"] not in existing]
+        if not new:
+            await update.message.reply_text(
+                f"Found {len(found)} projects, all registered."
+            )
+            return
+        buttons = []
+        for p in new[:20]:
+            markers = ", ".join(p["markers"][:3])
+            buttons.append([InlineKeyboardButton(
+                f"{p['name']} ({markers})",
+                callback_data=f"scan:{p['name']}",
+            )])
+        if len(new) > 1:
+            buttons.append([InlineKeyboardButton(
+                f"Add all {len(new)} projects",
+                callback_data="scan:__all__",
+            )])
+        context.bot_data["scan_results"] = {
+            p["name"]: p for p in new
+        }
+        await update.message.reply_text(
+            f"Found {len(new)} new projects:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif intent == "add_all":
+        results = context.bot_data.get("scan_results", {})
+        if not results:
+            await update.message.reply_text(
+                "Nothing to add. Say 'scan' first."
+            )
+            return
+        added = []
+        for pname, project in results.items():
+            db.add_project(
+                pname, project["path"], project["description"]
+            )
+            added.append(pname)
+        context.bot_data["scan_results"] = {}
+        await update.message.reply_text(
+            f"Added {len(added)} projects:\n"
+            + "\n".join(f"• {n}" for n in added)
+        )
+
+    elif intent == "add_one" and m:
+        name = m.group(1)
+        results = context.bot_data.get("scan_results", {})
+        project = results.get(name)
+        if project:
+            db.add_project(
+                name, project["path"], project["description"]
+            )
+            results.pop(name, None)
+            await update.message.reply_text(f"Added '{name}'.")
+        else:
+            await update.message.reply_text(
+                f"'{name}' not in scan results. "
+                "Use 'scan' first or /add <name> <path>."
+            )
+
+    elif intent == "remove" and m:
+        name = m.group(1)
+        if db.remove_project(name):
+            await update.message.reply_text(f"Removed '{name}'.")
+        else:
+            await update.message.reply_text(
+                f"'{name}' not found."
+            )
+
+    elif intent == "status":
+        projects = db.list_projects()
+        active = len(_clients)
+        busy = [
+            n for n in _running_tasks
+            if not _running_tasks[n].done()
+        ]
+        lines = [
+            f"Projects: {len(projects)}",
+            f"Active clients: {active}",
+            f"Busy: {', '.join(busy) if busy else 'none'}",
+            f"Heartbeat: {'on' if _heartbeat_enabled else 'off'}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+
+    elif intent == "reset" and m:
+        name = m.group(1)
+        if db.get_project(name):
+            reset_memory(name)
+            await update.message.reply_text(
+                f"Session reset for '{name}'."
+            )
+        else:
+            await update.message.reply_text(
+                f"'{name}' not found."
+            )
+
+    elif intent == "heartbeat":
+        val = m.group(1) if m and m.group(1) else None
+        if val == "on":
+            _heartbeat_enabled = True
+            await update.message.reply_text("Heartbeat enabled.")
+        elif val == "off":
+            _heartbeat_enabled = False
+            await update.message.reply_text("Heartbeat disabled.")
+        else:
+            state = "on" if _heartbeat_enabled else "off"
+            await update.message.reply_text(
+                f"Heartbeat is {state}."
+            )
+
+    elif intent == "permissions":
+        perms = db.list_allowed_tools()
+        if not perms:
+            await update.message.reply_text("No saved permissions.")
+            return
+        lines = [f"• <code>{html.escape(p)}</code>" for p in perms]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="HTML"
+        )
+
+    elif intent == "help":
+        await update.message.reply_text(
+            "<b>Commander mode</b>\n\n"
+            "• list projects\n"
+            "• scan\n"
+            "• add all / add <name>\n"
+            "• remove <name>\n"
+            "• status\n"
+            "• reset <name>\n"
+            "• heartbeat on/off\n"
+            "• permissions\n"
+            "• switch to <project>\n\n"
+            "Or just say what you need.",
+            parse_mode="HTML",
+        )
+
+    else:
+        await update.message.reply_text(
+            "I'm in commander mode. "
+            "Try: list projects, scan, status, help\n"
+            "Or 'switch to <project>' to work on code."
+        )
 
 
 # --- Text handler with auto-routing ---
@@ -1372,6 +1886,16 @@ async def handle_text(
     # 1. Natural-language switch intent ("switch to myproject", "use myproject")
     switch_target = _detect_switch_intent(prompt)
     if switch_target:
+        # "switch to commander/bot" activates meta-project
+        if switch_target.lower() in ("commander", "bot", "self"):
+            _active_project[user_id] = COMMANDER_PROJECT
+            await update.message.reply_text(
+                "Switched to <b>commander</b> mode. "
+                "Say 'help' for available commands.",
+                parse_mode="HTML",
+            )
+            return
+
         projects = db.list_projects()
         names = [p["name"] for p in projects]
         matches = difflib.get_close_matches(
@@ -1395,8 +1919,11 @@ async def handle_text(
             )
         return
 
-    # 1. Explicitly switched project
+    # 2. Commander meta-project — handle locally
     project_name = _get_active_project(user_id)
+    if project_name == COMMANDER_PROJECT:
+        await _handle_commander(update, prompt, context)
+        return
 
     # 2. Auto-route by description matching
     if not project_name:
@@ -1487,6 +2014,12 @@ async def handle_voice(
 
     user_id = update.effective_user.id
     project_name = _get_active_project(user_id)
+
+    # Commander meta-project — handle locally
+    if project_name == COMMANDER_PROJECT:
+        await _handle_commander(update, transcript, context)
+        return
+
     if not project_name:
         projects = db.list_projects()
         if not projects:
@@ -1688,6 +2221,11 @@ def main() -> None:
     )
     app.add_handler(
         CallbackQueryHandler(
+            callback_retry, pattern=r"^retry:"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
             callback_scan, pattern=r"^scan:"
         )
     )
@@ -1754,11 +2292,61 @@ def main() -> None:
 
     app.add_error_handler(error_handler)
 
+    _reaper_task: asyncio.Task | None = None
+
     async def post_init(application):
-        logger.info("Warming up projects in background...")
-        asyncio.create_task(warmup_projects())
+        nonlocal _reaper_task
+        _reaper_task = asyncio.create_task(idle_reaper())
+        logger.info(
+            "Ready — lazy connect, idle disconnect after %ds",
+            IDLE_DISCONNECT,
+        )
+
+        # Onboarding: if no projects registered, scan and offer to add
+        if not db.list_projects():
+            found = scan_projects()
+            if found:
+                buttons = []
+                for p in found[:20]:
+                    markers = ", ".join(p["markers"][:3])
+                    label = f"{p['name']} ({markers})"
+                    buttons.append([
+                        InlineKeyboardButton(
+                            label,
+                            callback_data=f"scan:{p['name']}",
+                        )
+                    ])
+                if len(found) > 1:
+                    buttons.append([
+                        InlineKeyboardButton(
+                            f"Add all {len(found)} projects",
+                            callback_data="scan:__all__",
+                        )
+                    ])
+                application.bot_data["scan_results"] = {
+                    p["name"]: p for p in found
+                }
+                await application.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"Welcome! Found {len(found)} projects. "
+                    "Tap to add or use /scan later:",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+            else:
+                await application.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    "Welcome! No projects found. "
+                    "Use /add <name> <path> to register one.",
+                )
 
     async def post_shutdown(application):
+        nonlocal _reaper_task
+        if _reaper_task and not _reaper_task.done():
+            _reaper_task.cancel()
+            try:
+                await _reaper_task
+            except asyncio.CancelledError:
+                pass
         names = list(_clients.keys())
         if names:
             logger.info("Disconnecting %d SDK client(s)...", len(names))

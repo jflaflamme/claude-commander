@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -34,9 +35,6 @@ logger = logging.getLogger(__name__)
 # Telegram message limit
 TG_MAX_LEN = 4096
 
-# Timeout for a single prompt (5 minutes)
-PROMPT_TIMEOUT = 300
-
 # Per-project persistent clients
 _clients: dict[str, ClaudeSDKClient] = {}
 
@@ -49,6 +47,21 @@ _running_tasks: dict[str, asyncio.Task] = {}
 # Pending permission requests: request_id -> (resolve_fn, anyio.Event)
 # Uses anyio.Event for compatibility with the SDK's anyio task groups
 _pending_permissions: dict[str, tuple[Callable, anyio.Event]] = {}
+
+# Projects currently waiting for a permission decision
+_permission_waiting: set[str] = {}
+
+# Last activity timestamp per project (updated on every SDK message)
+_last_activity: dict[str, float] = {}
+
+# Inactivity threshold — warn user if no SDK messages for this long
+INACTIVITY_TIMEOUT = int(os.getenv("INACTIVITY_TIMEOUT", "90"))
+
+# Hard prompt timeout — auto-kill after this many seconds
+PROMPT_TIMEOUT = int(os.getenv("PROMPT_TIMEOUT", "300"))
+
+# Idle client disconnect — kill subprocess after N seconds of no use
+IDLE_DISCONNECT = int(os.getenv("IDLE_DISCONNECT", "300"))
 
 # Telegram bot reference (set by bot.py at startup)
 _tg_bot = None
@@ -341,6 +354,7 @@ def _make_can_use_tool(project_name: str) -> Callable:
             event.set()
 
         _pending_permissions[request_id] = (_resolve, event)
+        _permission_waiting.add(project_name)
 
         detail = _tool_detail(tool_name, tool_input)
         msg = (
@@ -378,6 +392,7 @@ def _make_can_use_tool(project_name: str) -> Callable:
                 e, type(e).__name__,
             )
             _pending_permissions.pop(request_id, None)
+            _permission_waiting.discard(project_name)
             return PermissionResultAllow()
 
         logger.info(
@@ -385,11 +400,14 @@ def _make_can_use_tool(project_name: str) -> Callable:
             project_name, tool_name, request_id,
         )
         await event.wait()
+        _permission_waiting.discard(project_name)
 
         logger.info(
             "[%s] Permission resolved: tool=%s allowed=%s",
             project_name, tool_name, result[0],
         )
+        # Reset activity timer — permission wait shouldn't count as idle
+        _last_activity[project_name] = time.monotonic()
         if result[0]:
             return PermissionResultAllow()
         return PermissionResultDeny(
@@ -497,12 +515,48 @@ async def warmup_projects() -> None:
     )
 
 
+def get_last_activity(project_name: str) -> float:
+    """Return the monotonic timestamp of the last SDK message for a project."""
+    return _last_activity.get(project_name, 0.0)
+
+
+def is_awaiting_permission(project_name: str) -> bool:
+    """Return True if the project is waiting for a permission decision."""
+    return project_name in _permission_waiting
+
+
+async def idle_reaper() -> None:
+    """Background task: disconnect clients idle for IDLE_DISCONNECT seconds."""
+    while True:
+        await asyncio.sleep(60)  # check every minute
+        if not _clients or IDLE_DISCONNECT <= 0:
+            continue
+        now = time.monotonic()
+        to_disconnect = []
+        for name in list(_clients):
+            task = _running_tasks.get(name)
+            if task and not task.done():
+                continue
+            last = _last_activity.get(name, 0.0)
+            idle = now - last if last else float("inf")
+            if idle >= IDLE_DISCONNECT:
+                to_disconnect.append(name)
+        for name in to_disconnect:
+            logger.info(
+                "[%s] Idle %ds — disconnecting subprocess",
+                name, IDLE_DISCONNECT,
+            )
+            await disconnect_client(name)
+
+
 async def _handle_message(
     message: Any,
     project_name: str,
     emit: Callable[[str], Any],
 ) -> None:
     """Dispatch SDK messages to status updates and session tracking."""
+    _last_activity[project_name] = time.monotonic()
+
     # TaskProgressMessage is a SystemMessage subclass — check first
     if isinstance(message, TaskProgressMessage):
         label = message.description or (
@@ -564,6 +618,8 @@ async def run_prompt(
             "actions": [],
         }
 
+    _last_activity[project_name] = time.monotonic()
+
     preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
     logger.info("[%s] Prompt: %s", project_name, preview)
 
@@ -579,8 +635,13 @@ async def run_prompt(
             except Exception:
                 pass
 
+    # Resume existing session if available
+    session_id = db.get_active_session(project_name) or "default"
+    if session_id != "default":
+        logger.info("[%s] Resuming session %s", project_name, session_id[:8])
+
     try:
-        await client.query(prompt)
+        await client.query(prompt, session_id=session_id)
 
         result_text = ""
         async for message in client.receive_response():
@@ -610,10 +671,13 @@ async def run_prompt(
         logger.warning(
             "[%s] Error: %s — reconnecting", project_name, e
         )
+        # Preserve original session so we can restore on retry failure
+        original_session = session_id
         await disconnect_client(project_name)
         try:
             client = await _get_client(project_name, cwd)
-            await client.query(prompt)
+            session_id = db.get_active_session(project_name) or "default"
+            await client.query(prompt, session_id=session_id)
             result_text = ""
             async for message in client.receive_response():
                 await _handle_message(
@@ -632,6 +696,14 @@ async def run_prompt(
             logger.exception(
                 "[%s] Retry failed", project_name
             )
+            # Restore original session so next message resumes
+            # the conversation instead of the failed retry session
+            if original_session and original_session != "default":
+                db.save_session(project_name, original_session)
+                logger.info(
+                    "[%s] Restored original session %s",
+                    project_name, original_session[:8],
+                )
             return {
                 "text": f"Error: {retry_err}",
                 "actions": [],
